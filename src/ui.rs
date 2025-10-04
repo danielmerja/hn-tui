@@ -117,6 +117,7 @@ const NAV_SORTS: [reddit::SortOption; 5] = [
 const FEED_CACHE_TTL: Duration = Duration::from_secs(45);
 const COMMENT_CACHE_TTL: Duration = Duration::from_secs(120);
 const FEED_CACHE_MAX: usize = 16;
+const POST_PRELOAD_THRESHOLD: usize = 5;
 const COMMENT_CACHE_MAX: usize = 64;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const POST_LOADING_HEADER_HEIGHT: usize = 2;
@@ -205,7 +206,7 @@ impl KittyImage {
             self.id, self.cols, self.rows
         );
         if self.wrap_tmux {
-            format!("\x1bPtmux;\x1b{}\x1b\\", base)
+            format!("\x1bPtmux;\x1b{base}\x1b\\")
         } else {
             base
         }
@@ -216,7 +217,7 @@ impl KittyImage {
     }
 
     fn delete_sequence_for(id: u32, wrap_tmux: bool) -> String {
-        let base = format!("\x1b_Ga=d,q=2,i={};\x1b\\", id);
+        let base = format!("\x1b_Ga=d,q=2,i={id};\x1b\\");
         if wrap_tmux {
             format!("\x1bPtmux;\x1b{}\x1b\\", base)
         } else {
@@ -299,11 +300,13 @@ fn collect_comments(
         let author_label = if comment.author.trim().is_empty() {
             "[deleted]".to_string()
         } else {
-            format!("u/{}", comment.author)
+            let author = comment.author.as_str();
+            format!("u/{author}")
         };
         let mut link_entries = Vec::new();
         for (idx, url) in found_links.into_iter().enumerate() {
-            let label = format!("Comment link {} ({})", idx + 1, author_label);
+            let number = idx + 1;
+            let label = format!("Comment link {number} ({author_label})");
             link_entries.push(LinkEntry::new(label, url));
         }
         entries.push(CommentEntry {
@@ -386,8 +389,9 @@ impl Pane {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum MenuField {
+    #[default]
     ClientId,
     ClientSecret,
     UserAgent,
@@ -449,12 +453,6 @@ impl MenuField {
             MenuField::Save => "Save & Close",
             MenuField::CopyLink => "Copy Authorization Link",
         }
-    }
-}
-
-impl Default for MenuField {
-    fn default() -> Self {
-        MenuField::ClientId
     }
 }
 
@@ -618,6 +616,7 @@ enum NavMode {
 struct PendingPosts {
     request_id: u64,
     cancel_flag: Arc<AtomicBool>,
+    mode: LoadMode,
 }
 
 struct PendingComments {
@@ -641,6 +640,12 @@ struct PendingContent {
     cancel_flag: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadMode {
+    Replace,
+    Append,
+}
+
 #[derive(Clone)]
 enum VoteTarget {
     Post { fullname: String },
@@ -652,7 +657,7 @@ enum AsyncResponse {
         request_id: u64,
         target: String,
         sort: reddit::SortOption,
-        result: Result<Vec<PostPreview>>,
+        result: Result<PostBatch>,
     },
     PostRows {
         request_id: u64,
@@ -714,7 +719,8 @@ fn comment_lines(
         None => "·",
     };
 
-    let mut header = format!("{vote_marker} u/{} · {} points", author, comment.score);
+    let score = comment.score;
+    let mut header = format!("{vote_marker} u/{author} · {score} points");
     if collapsed {
         let hidden = comment.descendant_count;
         if hidden > 0 {
@@ -802,6 +808,17 @@ fn ensure_core_subreddits(subreddits: &mut Vec<String>) {
     *subreddits = combined;
 }
 
+fn fallback_feed_target(current: &str) -> Option<&'static str> {
+    let normalized = normalize_subreddit_name(current);
+    if is_front_page(&normalized) {
+        Some("r/popular")
+    } else if normalized.eq_ignore_ascii_case("r/popular") {
+        Some("r/all")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum CacheScope {
     Anonymous,
@@ -824,7 +841,7 @@ impl FeedCacheKey {
 }
 
 struct FeedCacheEntry {
-    posts: Vec<PostPreview>,
+    batch: PostBatch,
     fetched_at: Instant,
     scope: CacheScope,
 }
@@ -838,6 +855,12 @@ struct CommentCacheEntry {
 struct Spinner {
     index: usize,
     last_tick: Instant,
+}
+
+#[derive(Clone)]
+struct PostBatch {
+    posts: Vec<PostPreview>,
+    after: Option<String>,
 }
 
 impl Spinner {
@@ -1188,8 +1211,8 @@ fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> R
 
     let png_data = encode_png_for_kitty(bytes)?;
 
-    let cols = cols.max(1) as i32;
-    let rows = rows.max(1) as i32;
+    let cols = cols.max(1);
+    let rows = rows.max(1);
     let encoded = general_purpose::STANDARD.encode(png_data.as_ref());
     if encoded.is_empty() {
         bail!("failed to encode image preview");
@@ -1389,7 +1412,7 @@ fn line_visual_height(line: &Line<'_>, width: u16) -> usize {
     if content_width == 0 {
         1
     } else {
-        (content_width + width - 1) / width
+        content_width.div_ceil(width)
     }
 }
 
@@ -1601,6 +1624,7 @@ pub struct Model {
     status_message: String,
     subreddits: Vec<String>,
     posts: Vec<PostPreview>,
+    feed_after: Option<String>,
     comments: Vec<CommentEntry>,
     visible_comment_indices: Vec<usize>,
     collapsed_comments: HashSet<usize>,
@@ -1824,7 +1848,7 @@ impl Model {
                 let default_agent = config::RedditConfig::default().user_agent;
                 self.menu_form
                     .set_values(String::new(), String::new(), default_agent);
-                let message = format!("Failed to load existing config: {}", err);
+                let message = format!("Failed to load existing config: {err}");
                 self.menu_form.set_status(message.clone());
                 error_message = Some(message);
             }
@@ -1900,7 +1924,7 @@ impl Model {
     fn active_kitty_matches(&self, post_name: &str) -> bool {
         self.active_kitty
             .as_ref()
-            .map_or(false, |active| active.post_name == post_name)
+            .is_some_and(|active| active.post_name == post_name)
     }
 
     fn prepare_active_kitty_delete(&mut self) -> Option<String> {
@@ -1958,7 +1982,7 @@ impl Model {
         self.posts
             .get(self.selected_post)
             .and_then(|post| self.media_previews.get(&post.post.name))
-            .map_or(false, MediaPreview::has_kitty)
+            .is_some_and(MediaPreview::has_kitty)
     }
 
     pub fn new(opts: Options) -> Self {
@@ -1969,6 +1993,7 @@ impl Model {
             status_message: opts.status_message.clone(),
             subreddits: opts.subreddits.clone(),
             posts: opts.posts.clone(),
+            feed_after: None,
             comments: Vec::new(),
             visible_comment_indices: Vec::new(),
             collapsed_comments: HashSet::new(),
@@ -2072,7 +2097,7 @@ impl Model {
         }
 
         if let Err(err) = model.reload_posts() {
-            model.status_message = format!("Failed to load posts: {}", err);
+            model.status_message = format!("Failed to load posts: {err}");
             model.content = model.fallback_content.clone();
             model.content_source = model.fallback_source.clone();
         }
@@ -2525,7 +2550,7 @@ impl Model {
                             self.mark_dirty();
                         }
                         Err(err) => {
-                            self.status_message = format!("Failed to switch account: {}", err);
+                            self.status_message = format!("Failed to switch account: {err}");
                             self.mark_dirty();
                         }
                     }
@@ -2559,8 +2584,6 @@ impl Model {
                 } else {
                     if let Some(pos) = self.menu_accounts.iter().position(|entry| entry.is_active) {
                         self.menu_account_index = pos;
-                    } else if !self.menu_accounts.is_empty() {
-                        self.menu_account_index = 0;
                     } else {
                         self.menu_account_index = 0;
                     }
@@ -2601,14 +2624,14 @@ impl Model {
                                 self.status_message = message;
                             } else if let Err(err) = self.start_authorization_flow(path.as_path()) {
                                 let message =
-                                    format!("Failed to start Reddit authorization: {}", err);
+                                    format!("Failed to start Reddit authorization: {err}");
                                 self.menu_form.set_status(message.clone());
                                 self.status_message = message;
                             }
                             dirty = true;
                         }
                         Err(err) => {
-                            let message = format!("Failed to save credentials: {}", err);
+                            let message = format!("Failed to save credentials: {err}");
                             self.menu_form.set_status(message.clone());
                             self.status_message = message;
                             dirty = true;
@@ -2617,7 +2640,7 @@ impl Model {
                 }
                 MenuField::CopyLink => {
                     if let Err(err) = self.copy_auth_link_to_clipboard() {
-                        let message = format!("Failed to copy authorization link: {}", err);
+                        let message = format!("Failed to copy authorization link: {err}");
                         self.menu_form.set_status(message.clone());
                         self.status_message = message;
                     }
@@ -2639,7 +2662,7 @@ impl Model {
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 if self.menu_form.has_auth_link() {
                     if let Err(err) = self.copy_auth_link_to_clipboard() {
-                        let message = format!("Failed to copy authorization link: {}", err);
+                        let message = format!("Failed to copy authorization link: {err}");
                         self.menu_form.set_status(message.clone());
                         self.status_message = message;
                     }
@@ -2758,7 +2781,7 @@ impl Model {
             }
             KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => {
                 if let Err(err) = self.open_selected_link() {
-                    self.status_message = format!("Failed to open link: {}", err);
+                    self.status_message = format!("Failed to open link: {err}");
                     self.mark_dirty();
                 }
             }
@@ -2778,18 +2801,18 @@ impl Model {
             .link_menu_selected
             .min(self.link_menu_items.len().saturating_sub(1));
         let entry = &self.link_menu_items[index];
+        let label = entry.label.clone();
         let url = entry.url.clone();
 
         match webbrowser::open(&url) {
             Ok(_) => {
-                let message = format!("Opened {} in your browser.", entry.label);
+                let message = format!("Opened {label} in your browser.");
                 self.dismiss_link_menu(None);
                 self.status_message = message;
                 self.mark_dirty();
             }
             Err(err) => {
-                self.status_message =
-                    format!("Failed to open {}: {} (URL: {})", entry.label, err, url);
+                self.status_message = format!("Failed to open {label}: {err} (URL: {url})");
                 self.mark_dirty();
             }
         }
@@ -2805,7 +2828,7 @@ impl Model {
                 Ok(())
             }
             Err(err) => {
-                let message = format!("Failed to open support page: {}", err);
+                let message = format!("Failed to open support page: {err}");
                 self.status_message = message.clone();
                 self.mark_dirty();
                 Err(anyhow!(message))
@@ -2821,7 +2844,7 @@ impl Model {
                 Ok(())
             }
             Err(err) => {
-                let message = format!("Failed to open project page: {}", err);
+                let message = format!("Failed to open project page: {err}");
                 self.status_message = message.clone();
                 self.mark_dirty();
                 Err(anyhow!(message))
@@ -2839,8 +2862,6 @@ impl Model {
             Ok(_) => {
                 if let Some(pos) = self.menu_accounts.iter().position(|entry| entry.is_active) {
                     self.menu_account_index = pos;
-                } else if !self.menu_accounts.is_empty() {
-                    self.menu_account_index = 0;
                 } else {
                     self.menu_account_index = 0;
                 }
@@ -3014,12 +3035,12 @@ impl Model {
         self.ensure_cache_scope();
 
         if let Err(err) = self.reload_subreddits() {
-            let msg = format!("Failed to refresh subreddits: {}", err);
+            let msg = format!("Failed to refresh subreddits: {err}");
             self.menu_form.set_status(msg.clone());
             self.status_message = msg;
         }
         if let Err(err) = self.reload_posts() {
-            let msg = format!("Failed to reload posts: {}", err);
+            let msg = format!("Failed to reload posts: {err}");
             self.menu_form.set_status(msg.clone());
             self.status_message = msg;
         }
@@ -3068,17 +3089,26 @@ impl Model {
                 if pending.request_id != request_id {
                     return;
                 }
+                let mode = pending.mode;
                 self.pending_posts = None;
-                self.pending_comments = None;
+                if matches!(mode, LoadMode::Replace) {
+                    self.pending_comments = None;
+                }
 
                 match result {
-                    Ok(posts) => {
+                    Ok(batch) => {
                         let key = FeedCacheKey::new(&target, sort);
-                        self.cache_posts(key, posts.clone());
-                        self.apply_posts_result(&target, sort, posts, false);
+                        self.apply_posts_batch(&target, sort, batch, false, mode);
+                        if !self.posts.is_empty() {
+                            let snapshot = PostBatch {
+                                posts: self.posts.clone(),
+                                after: self.feed_after.clone(),
+                            };
+                            self.cache_posts(key, snapshot);
+                        }
                     }
                     Err(err) => {
-                        self.status_message = format!("Failed to load posts: {}", err);
+                        self.status_message = format!("Failed to load posts: {err}");
                     }
                 }
                 self.mark_dirty();
@@ -3149,7 +3179,7 @@ impl Model {
                         self.visible_comment_indices.clear();
                         self.selected_comment = 0;
                         self.comment_offset.set(0);
-                        self.comment_status = format!("Failed to load comments: {}", err);
+                        self.comment_status = format!("Failed to load comments: {err}");
                     }
                 }
                 self.dismiss_link_menu(None);
@@ -3223,11 +3253,11 @@ impl Model {
                         self.nav_mode = NavMode::Subreddits;
                         self.status_message = "Subreddits refreshed".to_string();
                         if let Err(err) = self.reload_posts() {
-                            self.status_message = format!("Failed to reload posts: {}", err);
+                            self.status_message = format!("Failed to reload posts: {err}");
                         }
                     }
                     Err(err) => {
-                        self.status_message = format!("Failed to refresh subreddits: {}", err);
+                        self.status_message = format!("Failed to refresh subreddits: {err}");
                     }
                 }
                 self.mark_dirty();
@@ -3625,7 +3655,7 @@ impl Model {
         for (index, comment) in self.comments.iter().enumerate() {
             while hidden_depths
                 .last()
-                .map_or(false, |depth| *depth >= comment.depth)
+                .is_some_and(|depth| *depth >= comment.depth)
             {
                 hidden_depths.pop();
             }
@@ -3648,9 +3678,7 @@ impl Model {
 
         if let Some(selection) = new_selection {
             self.selected_comment = selection;
-        } else if self.visible_comment_indices.is_empty() {
-            self.selected_comment = 0;
-        } else if fallback_to_first {
+        } else if self.visible_comment_indices.is_empty() || fallback_to_first {
             self.selected_comment = 0;
         } else {
             self.selected_comment = self
@@ -3747,11 +3775,75 @@ impl Model {
             self.dismiss_link_menu(None);
             self.sync_content_from_selection();
             if let Err(err) = self.load_comments_for_selection() {
-                self.comment_status = format!("Failed to load comments: {}", err);
+                self.comment_status = format!("Failed to load comments: {err}");
             }
         }
 
         self.ensure_post_visible();
+        self.maybe_request_more_posts();
+    }
+
+    fn maybe_request_more_posts(&mut self) {
+        if self.posts.is_empty() {
+            return;
+        }
+        if self.pending_posts.is_some() {
+            return;
+        }
+        let Some(after) = self.feed_after.as_ref() else {
+            return;
+        };
+        if after.trim().is_empty() {
+            return;
+        }
+        let remaining = self
+            .posts
+            .len()
+            .saturating_sub(self.selected_post.saturating_add(1));
+        if remaining > POST_PRELOAD_THRESHOLD {
+            return;
+        }
+        if let Err(err) = self.load_more_posts() {
+            self.status_message = format!("Failed to load more posts: {err}");
+        }
+    }
+
+    fn current_feed_target(&self) -> String {
+        if self.subreddits.is_empty() {
+            return "r/frontpage".to_string();
+        }
+        let index = self
+            .selected_sub
+            .min(self.subreddits.len().saturating_sub(1));
+        self.subreddits
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| "r/frontpage".to_string())
+    }
+
+    fn select_subreddit_by_name(&mut self, name: &str) -> bool {
+        if self.subreddits.is_empty() {
+            return false;
+        }
+        if let Some(idx) = self
+            .subreddits
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(name))
+        {
+            self.selected_sub = idx;
+            let nav_base = NAV_SORTS.len();
+            let nav_len = nav_base.saturating_add(self.subreddits.len());
+            let desired = nav_base.saturating_add(idx);
+            if nav_len > 0 {
+                self.nav_index = desired.min(nav_len.saturating_sub(1));
+            } else {
+                self.nav_index = 0;
+            }
+            self.nav_mode = NavMode::Subreddits;
+            true
+        } else {
+            false
+        }
     }
 
     fn ensure_post_visible(&self) {
@@ -3767,12 +3859,9 @@ impl Model {
         }
 
         let selected = self.selected_post.min(len - 1);
-        let mut offset = self.post_offset.get().min(selected);
-
-        let max_index = selected;
-        let mut height_cache: Vec<Option<usize>> = vec![None; max_index + 1];
+        let mut height_cache: Vec<Option<usize>> = vec![None; selected + 1];
         let mut height_for = |idx: usize| -> usize {
-            if idx > max_index {
+            if idx > selected {
                 return 0;
             }
             if let Some(height) = height_cache[idx] {
@@ -3783,10 +3872,9 @@ impl Model {
             height
         };
 
-        let mut prefix = vec![0usize; max_index.saturating_add(1) + 1];
-        for idx in 0..=max_index {
-            let height = height_for(idx);
-            prefix[idx + 1] = prefix[idx].saturating_add(height);
+        let mut prefix = vec![0usize; selected.saturating_add(1) + 1];
+        for idx in 0..=selected {
+            prefix[idx + 1] = prefix[idx].saturating_add(height_for(idx));
         }
 
         let span_height = |start: usize, end: usize| -> usize {
@@ -3796,44 +3884,47 @@ impl Model {
             prefix[end + 1].saturating_sub(prefix[start])
         };
 
-        let ensure_within_bottom = |offset: &mut usize| loop {
-            let available = self.available_post_height(*offset);
+        let mut best_choice: Option<(usize, f32)> = None;
+        let mut fallback_choice: Option<(usize, f32)> = None;
+
+        for candidate in 0..=selected {
+            let available = self.available_post_height(candidate);
             if available == 0 {
-                break;
+                continue;
             }
-            let height = span_height(*offset, selected);
-            if height <= available || *offset == selected {
-                break;
-            }
-            if *offset == selected {
-                break;
-            }
-            *offset = (*offset).saturating_add(1);
-        };
 
-        let ensure_space_above = |offset: &mut usize| {
-            while *offset > 0 {
-                let candidate = *offset - 1;
-                let available = self.available_post_height(candidate);
-                if available == 0 {
-                    break;
-                }
-                let height = span_height(candidate, selected);
-                if height > available {
-                    break;
-                }
-                *offset = candidate;
+            let selection_height = height_for(selected);
+            let bottom = span_height(candidate, selected);
+            if bottom > available {
+                continue;
             }
-        };
 
-        if selected < offset {
-            offset = selected;
+            let top = bottom.saturating_sub(selection_height);
+            let center = top as f32 + (selection_height as f32 / 2.0);
+            let lower_bound = (available as f32) * 0.25;
+            let upper_bound = (available as f32) * 0.75;
+            let midpoint = (available as f32) * 0.5;
+            let diff = (center - midpoint).abs();
+
+            if center >= lower_bound && center <= upper_bound {
+                match best_choice {
+                    Some((_, best_diff)) if diff >= best_diff => {}
+                    _ => best_choice = Some((candidate, diff)),
+                }
+            }
+
+            match fallback_choice {
+                Some((_, best_diff)) if diff >= best_diff => {}
+                _ => fallback_choice = Some((candidate, diff)),
+            }
         }
 
-        ensure_within_bottom(&mut offset);
-        ensure_space_above(&mut offset);
+        let chosen = best_choice
+            .or(fallback_choice)
+            .map(|(candidate, _)| candidate)
+            .unwrap_or(selected);
 
-        self.post_offset.set(offset);
+        self.post_offset.set(chosen);
     }
 
     fn ensure_comment_visible(&self) {
@@ -3855,26 +3946,24 @@ impl Model {
         }
 
         let selected = self.selected_comment.min(len - 1);
-        let mut offset = self.comment_offset.get().min(selected);
-
-        let max_index = selected;
-        let mut height_cache: Vec<Option<usize>> = vec![None; max_index + 1];
+        let mut height_cache: Vec<Option<usize>> = vec![None; selected.saturating_add(1)];
         let mut height_for = |idx: usize| -> usize {
-            if idx > max_index {
+            if idx > selected {
                 return 0;
             }
-            if let Some(height) = height_cache[idx] {
+            if let Some(height) = height_cache.get(idx).and_then(|cached| *cached) {
                 return height;
             }
             let height = self.comment_item_height(idx).max(1);
-            height_cache[idx] = Some(height);
+            if let Some(slot) = height_cache.get_mut(idx) {
+                *slot = Some(height);
+            }
             height
         };
 
-        let mut prefix = vec![0usize; max_index.saturating_add(1) + 1];
-        for idx in 0..=max_index {
-            let height = height_for(idx);
-            prefix[idx + 1] = prefix[idx].saturating_add(height);
+        let mut prefix = vec![0usize; selected.saturating_add(1) + 1];
+        for idx in 0..=selected {
+            prefix[idx + 1] = prefix[idx].saturating_add(height_for(idx));
         }
 
         let span_height = |start: usize, end: usize| -> usize {
@@ -3884,33 +3973,41 @@ impl Model {
             prefix[end + 1].saturating_sub(prefix[start])
         };
 
-        let ensure_within_bottom = |offset: &mut usize| loop {
-            let height = span_height(*offset, selected);
-            if height <= available || *offset == selected {
-                break;
-            }
-            *offset = (*offset).saturating_add(1);
-        };
+        let mut best_choice: Option<(usize, f32)> = None;
+        let mut fallback_choice: Option<(usize, f32)> = None;
+        let selection_height = height_for(selected);
+        let lower_bound = (available as f32) * 0.25;
+        let upper_bound = (available as f32) * 0.75;
+        let midpoint = (available as f32) * 0.5;
 
-        let ensure_space_above = |offset: &mut usize| {
-            while *offset > 0 {
-                let candidate = *offset - 1;
-                let height = span_height(candidate, selected);
-                if height > available {
-                    break;
+        for candidate in 0..=selected {
+            let bottom = span_height(candidate, selected);
+            if bottom > available {
+                continue;
+            }
+            let top = bottom.saturating_sub(selection_height);
+            let center = top as f32 + (selection_height as f32 / 2.0);
+            let diff = (center - midpoint).abs();
+
+            if center >= lower_bound && center <= upper_bound {
+                match best_choice {
+                    Some((_, best_diff)) if diff >= best_diff => {}
+                    _ => best_choice = Some((candidate, diff)),
                 }
-                *offset = candidate;
             }
-        };
 
-        if selected < offset {
-            offset = selected;
+            match fallback_choice {
+                Some((_, best_diff)) if diff >= best_diff => {}
+                _ => fallback_choice = Some((candidate, diff)),
+            }
         }
 
-        ensure_within_bottom(&mut offset);
-        ensure_space_above(&mut offset);
+        let chosen = best_choice
+            .or(fallback_choice)
+            .map(|(candidate, _)| candidate)
+            .unwrap_or(selected);
 
-        self.comment_offset.set(offset);
+        self.comment_offset.set(chosen);
     }
 
     fn post_item_height(&self, index: usize) -> usize {
@@ -3999,7 +4096,7 @@ impl Model {
         self.set_sort_by_index(next as usize)
     }
 
-    fn cache_posts(&mut self, key: FeedCacheKey, posts: Vec<PostPreview>) {
+    fn cache_posts(&mut self, key: FeedCacheKey, batch: PostBatch) {
         if self.feed_cache.len() >= FEED_CACHE_MAX {
             if let Some(old_key) = self
                 .feed_cache
@@ -4013,7 +4110,7 @@ impl Model {
         self.feed_cache.insert(
             key,
             FeedCacheEntry {
-                posts,
+                batch,
                 fetched_at: Instant::now(),
                 scope: self.cache_scope,
             },
@@ -4041,109 +4138,213 @@ impl Model {
         );
     }
 
-    fn apply_posts_result(
+    fn apply_posts_batch(
         &mut self,
         target: &str,
         sort: reddit::SortOption,
-        posts: Vec<PostPreview>,
+        mut batch: PostBatch,
         from_cache: bool,
+        mode: LoadMode,
     ) {
-        if posts.is_empty() {
-            let source = if from_cache { "(cached)" } else { "" };
-            self.status_message = format!(
-                "No posts available for {} ({}) {}",
-                target,
-                sort_label(sort),
-                source
-            )
-            .trim()
-            .to_string();
-            self.queue_active_kitty_delete();
-            self.posts.clear();
-            self.post_offset.set(0);
-            self.numeric_jump = None;
-            self.content_scroll = 0;
-            self.content = self.fallback_content.clone();
-            self.content_source = self.fallback_source.clone();
-            self.comments.clear();
-            self.collapsed_comments.clear();
-            self.visible_comment_indices.clear();
-            self.comment_offset.set(0);
-            self.comment_status = "No comments available.".to_string();
-            self.selected_comment = 0;
-            self.dismiss_link_menu(None);
-            self.content_cache.clear();
-            self.post_rows.clear();
-            self.post_rows_width = 0;
-            self.pending_post_rows = None;
-            self.media_previews.clear();
-            self.media_layouts.clear();
-            self.media_failures.clear();
-            self.needs_kitty_flush = false;
-            self.content_area = None;
-            if let Some(pending) = self.pending_content.take() {
-                pending.cancel_flag.store(true, Ordering::SeqCst);
-            }
-            return;
-        }
+        match mode {
+            LoadMode::Replace => {
+                if batch.posts.is_empty() {
+                    if !from_cache {
+                        if let Some(fallback) = fallback_feed_target(target) {
+                            if self.select_subreddit_by_name(fallback) {
+                                self.feed_after = None;
+                                self.status_message = format!(
+                                    "No posts available for {} ({}) — loading {} instead...",
+                                    target,
+                                    sort_label(sort),
+                                    fallback
+                                );
+                                if let Err(err) = self.reload_posts() {
+                                    self.status_message = format!(
+                                        "Tried {}, but failed to load posts: {}",
+                                        fallback, err
+                                    );
+                                }
+                                self.mark_dirty();
+                                return;
+                            }
+                        }
+                    }
 
-        self.status_message = if from_cache {
-            format!(
-                "Loaded {} posts from {} ({}) — cached",
-                posts.len(),
-                target,
-                sort_label(sort)
-            )
-        } else {
-            format!(
-                "Loaded {} posts from {} ({})",
-                posts.len(),
-                target,
-                sort_label(sort)
-            )
-        };
-        self.queue_active_kitty_delete();
-        self.posts = posts;
-        self.post_offset.set(0);
-        self.comment_offset.set(0);
-        self.dismiss_link_menu(None);
-        self.numeric_jump = None;
-        self.media_previews
-            .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
-        self.media_layouts
-            .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
-        self.media_failures
-            .retain(|key| self.posts.iter().any(|post| post.post.name == *key));
-        self.pending_media.retain(|key, flag| {
-            let keep = self.posts.iter().any(|post| post.post.name == *key);
-            if !keep {
-                flag.store(true, Ordering::SeqCst);
+                    let source = if from_cache { "(cached)" } else { "" };
+                    self.status_message = format!(
+                        "No posts available for {} ({}) {}",
+                        target,
+                        sort_label(sort),
+                        source
+                    )
+                    .trim()
+                    .to_string();
+                    self.queue_active_kitty_delete();
+                    self.posts.clear();
+                    self.feed_after = batch.after.take();
+                    self.post_offset.set(0);
+                    self.numeric_jump = None;
+                    self.content_scroll = 0;
+                    self.content = self.fallback_content.clone();
+                    self.content_source = self.fallback_source.clone();
+                    self.comments.clear();
+                    self.collapsed_comments.clear();
+                    self.visible_comment_indices.clear();
+                    self.comment_offset.set(0);
+                    self.comment_status = "No comments available.".to_string();
+                    self.selected_comment = 0;
+                    self.dismiss_link_menu(None);
+                    self.content_cache.clear();
+                    self.post_rows.clear();
+                    self.post_rows_width = 0;
+                    self.pending_post_rows = None;
+                    self.media_previews.clear();
+                    self.media_layouts.clear();
+                    self.media_failures.clear();
+                    self.needs_kitty_flush = false;
+                    self.content_area = None;
+                    if let Some(pending) = self.pending_content.take() {
+                        pending.cancel_flag.store(true, Ordering::SeqCst);
+                    }
+                    return;
+                }
+
+                self.status_message = if from_cache {
+                    format!(
+                        "Loaded {} posts from {} ({}) — cached",
+                        batch.posts.len(),
+                        target,
+                        sort_label(sort)
+                    )
+                } else {
+                    format!(
+                        "Loaded {} posts from {} ({})",
+                        batch.posts.len(),
+                        target,
+                        sort_label(sort)
+                    )
+                };
+                self.queue_active_kitty_delete();
+                self.posts = batch.posts;
+                self.feed_after = batch.after;
+                self.post_offset.set(0);
+                self.comment_offset.set(0);
+                self.dismiss_link_menu(None);
+                self.numeric_jump = None;
+                self.media_previews
+                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.media_layouts
+                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.media_failures
+                    .retain(|key| self.posts.iter().any(|post| post.post.name == *key));
+                self.pending_media.retain(|key, flag| {
+                    let keep = self.posts.iter().any(|post| post.post.name == *key);
+                    if !keep {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    keep
+                });
+                self.comment_cache
+                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.content_cache
+                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.post_rows
+                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.pending_post_rows = None;
+                self.post_rows_width = 0;
+                if let Some(pending) = self.pending_content.take() {
+                    pending.cancel_flag.store(true, Ordering::SeqCst);
+                }
+                self.selected_post = 0;
+                self.sync_content_from_selection();
+                self.selected_comment = 0;
+                self.comment_status = "Loading comments...".to_string();
+                self.comments.clear();
+                self.collapsed_comments.clear();
+                self.visible_comment_indices.clear();
+                self.comment_offset.set(0);
+                if let Err(err) = self.load_comments_for_selection() {
+                    self.comment_status = format!("Failed to load comments: {err}");
+                }
+                self.ensure_post_visible();
             }
-            keep
-        });
-        self.comment_cache
-            .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
-        self.content_cache
-            .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
-        self.post_rows
-            .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
-        self.pending_post_rows = None;
-        self.post_rows_width = 0;
-        if let Some(pending) = self.pending_content.take() {
-            pending.cancel_flag.store(true, Ordering::SeqCst);
+            LoadMode::Append => {
+                let previous_after = self.feed_after.clone();
+                self.feed_after = batch.after.clone();
+                if batch.posts.is_empty() {
+                    if self.feed_after.is_none() || self.feed_after == previous_after {
+                        if self.feed_after.is_none() {
+                            self.status_message =
+                                format!("Reached end of {} ({})", target, sort_label(sort));
+                        } else {
+                            self.status_message = format!(
+                                "No additional posts returned for {} ({}).",
+                                target,
+                                sort_label(sort)
+                            );
+                        }
+                    } else {
+                        self.status_message = format!(
+                            "No additional posts returned yet for {} ({}); requesting more...",
+                            target,
+                            sort_label(sort)
+                        );
+                        self.maybe_request_more_posts();
+                    }
+                    return;
+                }
+
+                let mut seen: HashSet<String> = self
+                    .posts
+                    .iter()
+                    .map(|post| post.post.name.clone())
+                    .collect();
+                let original_incoming = batch.posts.len();
+                batch
+                    .posts
+                    .retain(|post| seen.insert(post.post.name.clone()));
+
+                if batch.posts.is_empty() {
+                    if self.feed_after.is_none() || self.feed_after == previous_after {
+                        if self.feed_after.is_none() {
+                            self.status_message =
+                                format!("Reached end of {} ({})", target, sort_label(sort));
+                        } else {
+                            self.status_message = format!(
+                                "Skipped {} duplicate post{} from {} ({}).",
+                                original_incoming,
+                                if original_incoming == 1 { "" } else { "s" },
+                                target,
+                                sort_label(sort)
+                            );
+                        }
+                    } else {
+                        self.status_message = format!(
+                            "Skipped {} duplicate post{} from {} ({}); requesting more...",
+                            original_incoming,
+                            if original_incoming == 1 { "" } else { "s" },
+                            target,
+                            sort_label(sort)
+                        );
+                        self.maybe_request_more_posts();
+                    }
+                    return;
+                }
+
+                let added = batch.posts.len();
+                self.posts.extend(batch.posts);
+                self.status_message = format!(
+                    "Loaded {} more posts from {} ({}) — {} total.",
+                    added,
+                    target,
+                    sort_label(sort),
+                    self.posts.len()
+                );
+                self.ensure_post_visible();
+                self.maybe_request_more_posts();
+            }
         }
-        self.selected_post = 0;
-        self.sync_content_from_selection();
-        self.selected_comment = 0;
-        self.comment_status = "Loading comments...".to_string();
-        self.comments.clear();
-        self.collapsed_comments.clear();
-        self.visible_comment_indices.clear();
-        self.comment_offset.set(0);
-        if let Err(err) = self.load_comments_for_selection() {
-            self.comment_status = format!("Failed to load comments: {}", err);
-        }
-        self.ensure_post_visible();
     }
 
     fn is_loading(&self) -> bool {
@@ -4161,6 +4362,7 @@ impl Model {
             self.pending_comments = None;
             self.queue_active_kitty_delete();
             self.posts.clear();
+            self.feed_after = None;
             self.post_offset.set(0);
             self.numeric_jump = None;
             self.content_scroll = 0;
@@ -4184,11 +4386,7 @@ impl Model {
             return Ok(());
         };
 
-        let target = self
-            .subreddits
-            .get(self.selected_sub)
-            .cloned()
-            .unwrap_or_else(|| "r/frontpage".to_string());
+        let target = self.current_feed_target();
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let sort = self.sort;
@@ -4196,11 +4394,14 @@ impl Model {
 
         if let Some(entry) = self.feed_cache.get(&cache_key) {
             if entry.scope == self.cache_scope && entry.fetched_at.elapsed() < FEED_CACHE_TTL {
+                if let Some(pending) = self.pending_posts.take() {
+                    pending.cancel_flag.store(true, Ordering::SeqCst);
+                }
                 self.pending_posts = None;
                 if let Some(pending) = self.pending_comments.take() {
                     pending.cancel_flag.store(true, Ordering::SeqCst);
                 }
-                self.apply_posts_result(&target, sort, entry.posts.clone(), true);
+                self.apply_posts_batch(&target, sort, entry.batch.clone(), true, LoadMode::Replace);
                 self.mark_dirty();
                 return Ok(());
             }
@@ -4217,7 +4418,9 @@ impl Model {
         self.pending_posts = Some(PendingPosts {
             request_id,
             cancel_flag: cancel_flag.clone(),
+            mode: LoadMode::Replace,
         });
+        self.feed_after = None;
         self.status_message = format!("Loading {} ({})...", target, sort_label(sort));
         self.spinner.reset();
 
@@ -4233,26 +4436,37 @@ impl Model {
                     .to_string(),
             )
         };
+        let target_for_thread = target.clone();
+        let opts = reddit::ListingOptions {
+            after: None,
+            ..Default::default()
+        };
 
         thread::spawn(move || {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
-            let result = match subreddit {
-                Some(name) => service.load_subreddit(&name, sort).map(|listing| {
-                    listing
-                        .children
-                        .into_iter()
-                        .map(|thing| make_preview(thing.data))
-                        .collect::<Vec<_>>()
-                }),
-                None => service.load_front_page(sort).map(|listing| {
-                    listing
-                        .children
-                        .into_iter()
-                        .map(|thing| make_preview(thing.data))
-                        .collect::<Vec<_>>()
-                }),
+            let result = match subreddit.as_ref() {
+                Some(name) => service
+                    .load_subreddit(name, sort, opts.clone())
+                    .map(|listing| PostBatch {
+                        after: listing.after,
+                        posts: listing
+                            .children
+                            .into_iter()
+                            .map(|thing| make_preview(thing.data))
+                            .collect::<Vec<_>>(),
+                    }),
+                None => service
+                    .load_front_page(sort, opts.clone())
+                    .map(|listing| PostBatch {
+                        after: listing.after,
+                        posts: listing
+                            .children
+                            .into_iter()
+                            .map(|thing| make_preview(thing.data))
+                            .collect::<Vec<_>>(),
+                    }),
             };
 
             if cancel_flag.load(Ordering::SeqCst) {
@@ -4261,11 +4475,104 @@ impl Model {
 
             let _ = tx.send(AsyncResponse::Posts {
                 request_id,
-                target,
+                target: target_for_thread,
                 sort,
                 result,
             });
         });
+        Ok(())
+    }
+
+    fn load_more_posts(&mut self) -> Result<()> {
+        self.ensure_cache_scope();
+        if self.pending_posts.is_some() {
+            return Ok(());
+        }
+        let Some(after) = self.feed_after.clone() else {
+            return Ok(());
+        };
+        if after.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(service) = &self.feed_service else {
+            return Ok(());
+        };
+
+        let target = self.current_feed_target();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let sort = self.sort;
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.pending_posts = Some(PendingPosts {
+            request_id,
+            cancel_flag: cancel_flag.clone(),
+            mode: LoadMode::Append,
+        });
+        self.status_message = format!(
+            "Loading more posts from {} ({})...",
+            target,
+            sort_label(sort)
+        );
+        self.spinner.reset();
+
+        let tx = self.response_tx.clone();
+        let service = service.clone();
+        let subreddit = if is_front_page(&target) {
+            None
+        } else {
+            Some(
+                target
+                    .trim_start_matches("r/")
+                    .trim_start_matches('/')
+                    .to_string(),
+            )
+        };
+        let target_for_thread = target.clone();
+        let opts = reddit::ListingOptions {
+            after: Some(after),
+            ..Default::default()
+        };
+
+        thread::spawn(move || {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let result = match subreddit.as_ref() {
+                Some(name) => service
+                    .load_subreddit(name, sort, opts.clone())
+                    .map(|listing| PostBatch {
+                        after: listing.after,
+                        posts: listing
+                            .children
+                            .into_iter()
+                            .map(|thing| make_preview(thing.data))
+                            .collect::<Vec<_>>(),
+                    }),
+                None => service
+                    .load_front_page(sort, opts.clone())
+                    .map(|listing| PostBatch {
+                        after: listing.after,
+                        posts: listing
+                            .children
+                            .into_iter()
+                            .map(|thing| make_preview(thing.data))
+                            .collect::<Vec<_>>(),
+                    }),
+            };
+
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let _ = tx.send(AsyncResponse::Posts {
+                request_id,
+                target: target_for_thread,
+                sort,
+                result,
+            });
+        });
+
         Ok(())
     }
 
@@ -4569,7 +4876,7 @@ impl Model {
         if self
             .active_kitty
             .as_ref()
-            .map_or(false, |active| active.post_name != post_name)
+            .is_some_and(|active| active.post_name != post_name)
         {
             self.emit_active_kitty_delete(backend)?;
         }
@@ -4736,14 +5043,15 @@ impl Model {
             let label = format!("{} {} {}", number, marker, sort_label(*sort));
             sort_spans.push(Span::styled(label, style));
         }
-        let mut sort_lines = Vec::new();
-        sort_lines.push(Line::from(vec![Span::styled(
-            "Sort",
-            Style::default()
-                .fg(COLOR_TEXT_SECONDARY)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        sort_lines.push(Line::from(sort_spans));
+        let sort_lines = vec![
+            Line::from(vec![Span::styled(
+                "Sort",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(sort_spans),
+        ];
 
         let sorts_paragraph = Paragraph::new(Text::from(sort_lines))
             .alignment(Alignment::Left)
@@ -4780,17 +5088,13 @@ impl Model {
                 COLOR_PANEL_BG
             };
             let mut style = Style::default()
-                .fg(if is_selected {
-                    COLOR_TEXT_PRIMARY
-                } else if is_active {
+                .fg(if is_selected || is_active {
                     COLOR_TEXT_PRIMARY
                 } else {
                     COLOR_TEXT_SECONDARY
                 })
                 .bg(background);
-            if is_selected {
-                style = style.add_modifier(Modifier::BOLD);
-            } else if is_active {
+            if is_selected || is_active {
                 style = style.add_modifier(Modifier::BOLD);
             }
             let mut lines = wrap_plain(name, width, style);
@@ -4870,16 +5174,14 @@ impl Model {
                 COLOR_PANEL_BG
             };
 
-            let identity_color = if highlight {
+            let primary_color = if highlight {
                 COLOR_ACCENT
-            } else if focused {
-                COLOR_TEXT_PRIMARY
-            } else if selected {
+            } else if focused || selected {
                 COLOR_TEXT_PRIMARY
             } else {
                 COLOR_TEXT_SECONDARY
             };
-            let identity_style = Style::default().fg(identity_color).bg(background);
+            let identity_style = Style::default().fg(primary_color).bg(background);
             let mut title_style = Style::default()
                 .fg(if focused {
                     COLOR_TEXT_PRIMARY
@@ -4893,16 +5195,7 @@ impl Model {
             if highlight {
                 title_style = title_style.add_modifier(Modifier::BOLD);
             }
-            let metrics_color = if highlight {
-                COLOR_ACCENT
-            } else if focused {
-                COLOR_TEXT_PRIMARY
-            } else if selected {
-                COLOR_TEXT_PRIMARY
-            } else {
-                COLOR_TEXT_SECONDARY
-            };
-            let metrics_style = Style::default().fg(metrics_color).bg(background);
+            let metrics_style = Style::default().fg(primary_color).bg(background);
 
             let post_name = &item.post.name;
             let mut push_item = |mut lines: Vec<Line<'static>>| {
@@ -5202,11 +5495,7 @@ impl Model {
                 meta_style = meta_style.add_modifier(Modifier::ITALIC);
             }
 
-            let body_color = if highlight {
-                COLOR_TEXT_PRIMARY
-            } else if focused {
-                COLOR_TEXT_PRIMARY
-            } else if selected {
+            let body_color = if highlight || focused || selected {
                 COLOR_TEXT_PRIMARY
             } else {
                 COLOR_TEXT_SECONDARY
@@ -5278,19 +5567,20 @@ impl Model {
             ))]));
         } else {
             for entry in &self.link_menu_items {
-                let mut lines = Vec::new();
-                lines.push(Line::from(Span::styled(
-                    entry.label.clone(),
-                    Style::default()
-                        .fg(COLOR_TEXT_PRIMARY)
-                        .bg(COLOR_PANEL_BG)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(Span::styled(
-                    entry.url.clone(),
-                    Style::default().fg(COLOR_ACCENT).bg(COLOR_PANEL_BG),
-                )));
-                lines.push(Line::default());
+                let lines = vec![
+                    Line::from(Span::styled(
+                        entry.label.clone(),
+                        Style::default()
+                            .fg(COLOR_TEXT_PRIMARY)
+                            .bg(COLOR_PANEL_BG)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        entry.url.clone(),
+                        Style::default().fg(COLOR_ACCENT).bg(COLOR_PANEL_BG),
+                    )),
+                    Line::default(),
+                ];
                 items.push(ListItem::new(lines));
             }
         }

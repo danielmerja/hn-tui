@@ -9,9 +9,17 @@ pub trait SubredditService: Send + Sync {
 }
 
 pub trait FeedService: Send + Sync {
-    fn load_front_page(&self, sort: SortOption) -> Result<reddit::Listing<reddit::Post>>;
-    fn load_subreddit(&self, name: &str, sort: SortOption)
-        -> Result<reddit::Listing<reddit::Post>>;
+    fn load_front_page(
+        &self,
+        sort: SortOption,
+        opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>>;
+    fn load_subreddit(
+        &self,
+        name: &str,
+        sort: SortOption,
+        opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>>;
 }
 
 pub trait CommentService: Send + Sync {
@@ -62,9 +70,13 @@ impl RedditFeedService {
 }
 
 impl FeedService for RedditFeedService {
-    fn load_front_page(&self, sort: SortOption) -> Result<reddit::Listing<reddit::Post>> {
+    fn load_front_page(
+        &self,
+        sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
         self.client
-            .front_page(sort, ListingOptions::default())
+            .front_page(sort, opts)
             .context("fetch front page")
     }
 
@@ -72,9 +84,10 @@ impl FeedService for RedditFeedService {
         &self,
         name: &str,
         sort: SortOption,
+        opts: ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>> {
         self.client
-            .subreddit_listing(name, sort, ListingOptions::default())
+            .subreddit_listing(name, sort, opts)
             .context("fetch subreddit feed")
     }
 }
@@ -161,7 +174,11 @@ impl SubredditService for MockSubredditService {
 pub struct MockFeedService;
 
 impl FeedService for MockFeedService {
-    fn load_front_page(&self, _sort: SortOption) -> Result<reddit::Listing<reddit::Post>> {
+    fn load_front_page(
+        &self,
+        _sort: SortOption,
+        _opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
         Ok(mock_listing("Welcome to Reddix"))
     }
 
@@ -169,8 +186,9 @@ impl FeedService for MockFeedService {
         &self,
         name: &str,
         _sort: SortOption,
+        _opts: reddit::ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>> {
-        Ok(mock_listing(&format!("Sample posts for {}", name)))
+        Ok(mock_listing(&format!("Sample posts for {name}")))
     }
 }
 
@@ -183,12 +201,12 @@ impl CommentService for MockCommentService {
             post: reddit::Post {
                 id: article.into(),
                 name: article.into(),
-                title: format!("{} — {}", subreddit, article),
+                title: format!("{subreddit} — {article}"),
                 subreddit: subreddit.into(),
                 author: "reddix".into(),
                 selftext: "Comments are unavailable in this mock response.".into(),
                 url: String::new(),
-                permalink: format!("/{}/{}", subreddit, article),
+                permalink: format!("/{subreddit}/{article}"),
                 score: 1,
                 likes: None,
                 num_comments: 0,

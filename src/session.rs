@@ -38,15 +38,31 @@ impl Manager {
     }
 
     pub fn load_existing(&self) -> Result<()> {
+        let preferred_active = self.store.last_active_account_id()?;
         let accounts = self.store.list_accounts()?;
+        let mut prepared_sessions = Vec::new();
+        let mut new_active = None;
+
         for account in accounts {
             if let Some(token) = self.store.get_token(account.id)? {
                 let session = self.flow.resume(account.clone(), token)?;
-                self.sessions.write().insert(account.id, session);
-                if self.active_id.read().is_none() {
-                    *self.active_id.write() = Some(account.id);
+                if preferred_active == Some(account.id) || new_active.is_none() {
+                    new_active = Some(account.id);
                 }
+                prepared_sessions.push((account.id, session));
             }
+        }
+
+        {
+            let mut sessions = self.sessions.write();
+            for (id, session) in prepared_sessions {
+                sessions.insert(id, session);
+            }
+        }
+
+        *self.active_id.write() = new_active;
+        if preferred_active != new_active {
+            self.store.set_last_active_account_id(new_active)?;
         }
         Ok(())
     }
@@ -66,7 +82,11 @@ impl Manager {
     }
 
     pub fn switch(&self, account_id: i64) -> Result<AuthSession> {
-        if let Some(session) = self.sessions.read().get(&account_id).cloned() {
+        if let Some(session) = {
+            let sessions = self.sessions.read();
+            sessions.get(&account_id).cloned()
+        } {
+            self.store.set_last_active_account_id(Some(account_id))?;
             *self.active_id.write() = Some(account_id);
             return Ok(session);
         }
@@ -81,6 +101,7 @@ impl Manager {
             .ok_or(SessionError::TokenNotFound)?;
         let session = self.flow.resume(account.clone(), token)?;
         self.sessions.write().insert(account_id, session.clone());
+        self.store.set_last_active_account_id(Some(account_id))?;
         *self.active_id.write() = Some(account_id);
         Ok(session)
     }
@@ -94,6 +115,8 @@ impl Manager {
         self.sessions
             .write()
             .insert(session.account.id, session.clone());
+        self.store
+            .set_last_active_account_id(Some(session.account.id))?;
         *self.active_id.write() = Some(session.account.id);
         Ok(session)
     }

@@ -66,11 +66,11 @@ impl Store {
 
         let conn = Connection::open(&path)
             .with_context(|| format!("storage: open database at {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", &"WAL")
+        conn.pragma_update(None, "journal_mode", "WAL")
             .context("storage: set WAL")?;
-        conn.pragma_update(None, "foreign_keys", &"ON")
+        conn.pragma_update(None, "foreign_keys", "ON")
             .context("storage: enable foreign keys")?;
-        conn.pragma_update(None, "busy_timeout", &5000)
+        conn.pragma_update(None, "busy_timeout", 5000)
             .context("storage: set busy timeout")?;
         migrate(&conn)?;
 
@@ -164,6 +164,46 @@ ORDER BY updated_at DESC
             .query_map([], account_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn last_active_account_id(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = 'last_active_account_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("storage: query last active account")?;
+        if let Some(value) = value {
+            Ok(value.parse::<i64>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_last_active_account_id(&self, account_id: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock();
+        match account_id {
+            Some(id) => {
+                conn.execute(
+                    r#"
+INSERT INTO app_state (key, value)
+VALUES ('last_active_account_id', ?1)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+"#,
+                    params![id.to_string()],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM app_state WHERE key = 'last_active_account_id'",
+                    [],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn upsert_token(&self, token: Token) -> Result<()> {
@@ -474,6 +514,12 @@ CREATE TABLE IF NOT EXISTS media_cache (
 CREATE INDEX IF NOT EXISTS idx_media_cache_fetched_at ON media_cache(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_media_cache_expires_at ON media_cache(expires_at);
 "#,
+        r#"
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+"#,
     ]
 }
 
@@ -495,6 +541,25 @@ mod tests {
         })
         .unwrap();
         assert!(path.exists());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn remember_last_active_account() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(Options { path: Some(path) }).unwrap();
+
+        assert_eq!(store.last_active_account_id().unwrap(), None);
+
+        store
+            .set_last_active_account_id(Some(42))
+            .expect("persist id");
+        assert_eq!(store.last_active_account_id().unwrap(), Some(42));
+
+        store.set_last_active_account_id(None).expect("clear id");
+        assert_eq!(store.last_active_account_id().unwrap(), None);
+
         store.close().unwrap();
     }
 }
