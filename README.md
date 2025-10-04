@@ -1,0 +1,34 @@
+# Reddix
+
+[![Release](https://img.shields.io/github/v/release/ck-zhang/reddix?style=flat-square)](https://github.com/ck-zhang/reddix/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+
+Reddix - Reddit, refined for the terminal.
+
+![Reddix UI](docs/assets/reddix-ui-preview.png)
+
+## Features
+
+- image preview based on kitty graphics protocol
+- multi-account support
+- keyboard first navigation
+- smart caching
+
+## Install
+
+Download the latest [release](https://github.com/ck-zhang/reddix/releases/latest) from GitHub or run one of the installers
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ck-zhang/reddix/releases/latest/download/reddix-installer.sh | sh
+```
+
+## Quickstart
+1. Create a Reddit “script” at https://www.reddit.com/prefs/apps and set the redirect URI to `http://127.0.0.1:65010/reddix/callback`.
+2. Drop your client ID and secret into `~/.config/reddix/config.yaml`.
+3. Launch `reddix`, press `m`, and follow the guided menu to authorize your account.
+
+Core shortcuts: `j/k` move, `h/l` change panes, `m` menu, `o` link menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
+
+## Support
+- Feature requests and contributions are welcome, this project is in its very early stage.
+- Donation: https://ko-fi.com/ckzhang

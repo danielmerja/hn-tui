@@ -5916,7 +5916,7 @@ impl Model {
         )]));
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::raw(
-            "1. Open Reddit app preferences at https://www.reddit.com/prefs/apps and create a script or installed app."
+            "1. Open Reddit app preferences at https://www.reddit.com/prefs/apps and create a script app."
                 .to_string(),
         )]));
         lines.push(Line::from(vec![Span::raw(
