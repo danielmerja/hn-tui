@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, Read, Stdout, Write};
 use std::path::Path;
@@ -44,6 +45,7 @@ use crate::auth;
 use crate::config;
 use crate::data::{CommentService, FeedService, InteractionService, SubredditService};
 use crate::markdown;
+use crate::media;
 use crate::reddit;
 use crate::session;
 use crate::storage;
@@ -968,6 +970,7 @@ fn content_from_post(post: &PostPreview) -> String {
 fn load_media_preview(
     post: &reddit::Post,
     cancel_flag: &AtomicBool,
+    media_handle: Option<media::Handle>,
 ) -> Result<Option<MediaPreview>> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -1011,8 +1014,16 @@ fn load_media_preview(
         return Ok(None);
     }
 
-    let bytes =
-        fetch_image_bytes(&url).with_context(|| format!("download preview image {}", url))?;
+    let bytes = if let Some(handle) = media_handle {
+        match fetch_cached_media_bytes(handle, &url, source.width, source.height, cancel_flag) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(_) => fetch_image_bytes(&url)
+                .with_context(|| format!("download preview image {}", url))?,
+        }
+    } else {
+        fetch_image_bytes(&url).with_context(|| format!("download preview image {}", url))?
+    };
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
     }
@@ -1032,6 +1043,45 @@ fn load_media_preview(
         placeholder,
         kitty: Some(kitty),
     }))
+}
+
+fn fetch_cached_media_bytes(
+    handle: media::Handle,
+    url: &str,
+    width: i64,
+    height: i64,
+    cancel_flag: &AtomicBool,
+) -> Result<Option<Vec<u8>>> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    let request = media::Request {
+        url: url.to_string(),
+        width: (width > 0).then_some(width),
+        height: (height > 0).then_some(height),
+        ..Default::default()
+    };
+
+    let rx = handle.enqueue(request);
+    let result = rx
+        .recv()
+        .map_err(|err| anyhow!("media: failed to receive cache result: {}", err))?;
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    if let Some(entry) = result.entry {
+        let path = Path::new(&entry.file_path);
+        let bytes =
+            fs::read(path).with_context(|| format!("read cached media {}", path.display()))?;
+        Ok(Some(bytes))
+    } else if let Some(err) = result.error {
+        Err(err)
+    } else {
+        bail!("media: cache returned empty result")
+    }
 }
 
 fn kitty_placeholder_text(cols: i32, rows: i32, indent: u16, label: &str) -> Text<'static> {
@@ -1615,6 +1665,7 @@ pub struct Options {
     pub default_sort: reddit::SortOption,
     pub comment_service: Option<Arc<dyn CommentService + Send + Sync>>,
     pub interaction_service: Option<Arc<dyn InteractionService + Send + Sync>>,
+    pub media_handle: Option<media::Handle>,
     pub config_path: String,
     pub store: Arc<storage::Store>,
     pub session_manager: Option<Arc<session::Manager>>,
@@ -1636,6 +1687,7 @@ pub struct Model {
     media_failures: HashSet<String>,
     pending_media: HashMap<String, Arc<AtomicBool>>,
     media_layouts: HashMap<String, MediaLayout>,
+    media_handle: Option<media::Handle>,
     feed_cache: HashMap<FeedCacheKey, FeedCacheEntry>,
     comment_cache: HashMap<String, CommentCacheEntry>,
     post_rows: HashMap<String, PostRowData>,
@@ -2005,6 +2057,7 @@ impl Model {
             media_failures: HashSet::new(),
             pending_media: HashMap::new(),
             media_layouts: HashMap::new(),
+            media_handle: opts.media_handle.clone(),
             feed_cache: HashMap::new(),
             comment_cache: HashMap::new(),
             post_rows: HashMap::new(),
@@ -4650,13 +4703,14 @@ impl Model {
         self.pending_media.insert(key.clone(), cancel_flag.clone());
         let tx = self.response_tx.clone();
         let post_clone = post.clone();
+        let media_handle = self.media_handle.clone();
 
         thread::spawn(move || {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
             let name = post_clone.name.clone();
-            let result = load_media_preview(&post_clone, cancel_flag.as_ref());
+            let result = load_media_preview(&post_clone, cancel_flag.as_ref(), media_handle);
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }

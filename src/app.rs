@@ -27,6 +27,7 @@ pub fn run() -> Result<()> {
         http_client: None,
     };
     let media_manager = media::Manager::new(store.clone(), media_cfg).ok();
+    let media_handle = media_manager.as_ref().map(|manager| manager.handle());
 
     let theme = &cfg.ui.theme;
     let mut status = format!("Theme {theme} active. Press m for the guided menu or q to quit.");
@@ -149,6 +150,7 @@ pub fn run() -> Result<()> {
         default_sort: reddit::SortOption::Hot,
         comment_service,
         interaction_service,
+        media_handle,
         config_path: display_path.clone(),
         store: store.clone(),
         session_manager: session_manager.clone(),

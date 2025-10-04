@@ -71,6 +71,11 @@ pub struct Manager {
     handles: Vec<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct Handle {
+    inner: Arc<Inner>,
+}
+
 impl Manager {
     pub fn new(store: Arc<storage::Store>, cfg: Config) -> Result<Self> {
         let mut cfg = cfg;
@@ -118,10 +123,13 @@ impl Manager {
     }
 
     pub fn enqueue(&self, request: Request) -> Receiver<ResultEntry> {
-        let (tx, rx) = unbounded();
-        let job = Job { request, tx };
-        let _ = self.inner.jobs.send(job);
-        rx
+        self.handle().enqueue(request)
+    }
+
+    pub fn handle(&self) -> Handle {
+        Handle {
+            inner: self.inner.clone(),
+        }
     }
 
     fn shutdown(&mut self) {
@@ -137,6 +145,15 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+impl Handle {
+    pub fn enqueue(&self, request: Request) -> Receiver<ResultEntry> {
+        let (tx, rx) = unbounded();
+        let job = Job { request, tx };
+        let _ = self.inner.jobs.send(job);
+        rx
     }
 }
 
