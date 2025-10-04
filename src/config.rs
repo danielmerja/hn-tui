@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_ENV_PREFIX: &str = "REDDIX";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Config {
     #[serde(default)]
     pub reddit: RedditConfig,
@@ -19,17 +19,6 @@ pub struct Config {
     pub media: MediaConfig,
     #[serde(default)]
     pub player: PlayerConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            reddit: RedditConfig::default(),
-            ui: UIConfig::default(),
-            media: MediaConfig::default(),
-            player: PlayerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -361,6 +350,7 @@ pub fn save_reddit_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use tempfile::tempdir;
 
     #[test]
@@ -379,4 +369,11 @@ mod tests {
         assert_eq!(saved.reddit.client_id, "client");
     }
 
+    #[test]
+    fn env_overrides() {
+        env::set_var("REDDIX_UI__THEME", "dracula");
+        let cfg = load(LoadOptions::default()).unwrap();
+        assert_eq!(cfg.ui.theme, "dracula");
+        env::remove_var("REDDIX_UI__THEME");
+    }
 }

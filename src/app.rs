@@ -28,13 +28,10 @@ pub fn run() -> Result<()> {
     };
     let media_manager = media::Manager::new(store.clone(), media_cfg).ok();
 
-    let mut status = format!(
-        "Theme {} active. Press m for the guided menu or q to quit.",
-        cfg.ui.theme
-    );
+    let theme = &cfg.ui.theme;
+    let mut status = format!("Theme {theme} active. Press m for the guided menu or q to quit.");
     let mut content = format!(
-        "Open the guided menu with m, then press a to add a Reddit account.\n\nConfigure reddit.client_id, reddit.client_secret (optional), and reddit.redirect_uri in {} before authorizing.",
-        display_path
+        "Open the guided menu with m, then press a to add a Reddit account.\n\nConfigure reddit.client_id, reddit.client_secret (optional), and reddit.redirect_uri in {display_path} before authorizing."
     );
     let mut subreddits = vec![
         "r/frontpage".to_string(),
@@ -85,14 +82,10 @@ pub fn run() -> Result<()> {
                 let manager = Arc::new(raw_manager);
                 if manager.load_existing().is_ok() {
                     if let Some(session) = manager.active() {
-                        status = format!(
-                            "Signed in as {}. Press q to quit.",
-                            session.account.username
-                        );
-                        content = format!(
-                            "Active account: {}\nRemaining requests: loading...",
-                            session.account.username
-                        );
+                        let username = session.account.username.clone();
+                        status = format!("Signed in as {username}. Press q to quit.");
+                        content =
+                            format!("Active account: {username}\nRemaining requests: loading...");
 
                         if let Ok(token_provider) = manager.active_token_provider() {
                             if let Ok(client) = reddit::Client::new(
@@ -130,8 +123,7 @@ pub fn run() -> Result<()> {
                         status = "Ready to authorize a Reddit account. Press m then a to begin."
                             .to_string();
                         content = format!(
-                            "Your Reddit API credentials were found, but no account is signed in yet.\nPress m to open the guided menu, choose Add account, and follow the authorization flow.\nConfig file: {}",
-                            display_path
+                            "Your Reddit API credentials were found, but no account is signed in yet.\nPress m to open the guided menu, choose Add account, and follow the authorization flow.\nConfig file: {display_path}"
                         );
                     }
                 }
@@ -140,12 +132,10 @@ pub fn run() -> Result<()> {
         }
     } else {
         status = format!(
-            "Reddit credentials missing. Add reddit.client_id to {} and press m to authorize.",
-            display_path
+            "Reddit credentials missing. Add reddit.client_id to {display_path} and press m to authorize."
         );
         content = format!(
-            "Update {} with a reddit.client_id (and optional reddit.client_secret).\nThen press m and choose Add account to sign in. Until then you can explore the interface using the built-in quickstart cards.",
-            display_path
+            "Update {display_path} with a reddit.client_id (and optional reddit.client_secret).\nThen press m and choose Add account to sign in. Until then you can explore the interface using the built-in quickstart cards."
         );
     }
 
@@ -193,20 +183,20 @@ fn friendly_path(path: Option<&std::path::PathBuf>) -> String {
 }
 
 fn placeholder_post(id: &str, title: &str, description: &str) -> ui::PostPreview {
-    let body = format!("{}\n\n{}", title, description);
+    let body = format!("{title}\n\n{description}");
     let links = Vec::new();
     ui::PostPreview {
         title: title.to_string(),
         body,
         post: reddit::Post {
             id: id.to_string(),
-            name: format!("t3_{}", id),
+            name: format!("t3_{id}"),
             title: title.to_string(),
             subreddit: "r/reddix".to_string(),
             author: "reddix".to_string(),
             selftext: description.to_string(),
             url: String::new(),
-            permalink: format!("/r/reddix/{}", id),
+            permalink: format!("/r/reddix/{id}"),
             score: 0,
             likes: None,
             num_comments: 0,

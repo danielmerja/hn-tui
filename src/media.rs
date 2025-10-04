@@ -36,7 +36,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub url: String,
     pub media_type: Option<String>,
@@ -44,19 +44,6 @@ pub struct Request {
     pub height: Option<i64>,
     pub ttl: Option<Duration>,
     pub force: bool,
-}
-
-impl Default for Request {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            media_type: None,
-            width: None,
-            height: None,
-            ttl: None,
-            force: false,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -233,7 +220,7 @@ impl Inner {
             height,
             size_bytes: bytes.len() as i64,
             fetched_at: Utc::now(),
-            expires_at: expires_at.map(|ts| DateTime::<Utc>::from(ts)),
+            expires_at: expires_at.map(DateTime::<Utc>::from),
             checksum,
         };
 

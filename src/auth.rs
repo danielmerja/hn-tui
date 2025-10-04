@@ -210,11 +210,11 @@ impl Flow {
             redirect.path()
         };
 
-        let listen_addr = format!("{}:{}", host, port);
-        let server = Server::http(&listen_addr).map_err(|err| anyhow!("auth: listen: {}", err))?;
+        let listen_addr = format!("{host}:{port}");
+        let server = Server::http(&listen_addr).map_err(|err| anyhow!("auth: listen: {err}"))?;
         let actual_addr = server.server_addr();
 
-        let actual_redirect = Url::parse(&format!("http://{}{}", actual_addr, path))?;
+        let actual_redirect = Url::parse(&format!("http://{actual_addr}{path}"))?;
         let auth_url = self.authorize_url(actual_redirect.as_str(), &state, &challenge)?;
 
         let (result_tx, result_rx) = bounded::<AuthResult>(1);
@@ -341,7 +341,7 @@ impl Flow {
                 error: Some(err),
             }) => Err(err),
             Ok(_) => Err(anyhow!("auth: authorization cancelled")),
-            Err(err) => Err(anyhow!("auth: wait error: {}", err)),
+            Err(err) => Err(anyhow!("auth: wait error: {err}")),
         }
     }
 
@@ -372,13 +372,13 @@ impl Flow {
 
         let resp = req
             .send()
-            .with_context(|| format!("auth: token request (basic_auth={})", applied_basic_auth))?;
+            .with_context(|| format!("auth: token request (basic_auth={applied_basic_auth})"))?;
         if !resp.status().is_success() {
             let body = resp.text().unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<TokenError>(&body) {
-                bail!("auth: token request failed: {}", err);
+                bail!("auth: token request failed: {err}");
             }
-            bail!("auth: token request failed: {}", body);
+            bail!("auth: token request failed: {body}");
         }
 
         let payload: TokenResponse = resp.json().context("auth: decode token response")?;
@@ -410,17 +410,18 @@ impl Flow {
     }
 
     fn fetch_identity(&self, token: &OAuthTokenDetails) -> Result<Identity> {
+        let access_token = &token.access_token;
         let resp = self
             .client
             .get(&self.cfg.identity_url)
             .header(USER_AGENT, self.cfg.user_agent.clone())
-            .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
             .send()
             .context("auth: identity request")?;
 
         if !resp.status().is_success() {
             let body = resp.text().unwrap_or_default();
-            bail!("auth: identity request failed: {}", body);
+            bail!("auth: identity request failed: {body}");
         }
 
         let payload: IdentityResponse = resp.json().context("auth: decode identity")?;
@@ -573,13 +574,13 @@ fn refresh_token(
 
     let resp = req
         .send()
-        .with_context(|| format!("auth: refresh token request (basic_auth={})", used_basic))?;
+        .with_context(|| format!("auth: refresh token request (basic_auth={used_basic})"))?;
     if !resp.status().is_success() {
         let body = resp.text().unwrap_or_default();
         if let Ok(err) = serde_json::from_str::<TokenError>(&body) {
-            bail!("auth: refresh failed: {}", err);
+            bail!("auth: refresh failed: {err}");
         }
-        bail!("auth: refresh failed: {}", body);
+        bail!("auth: refresh failed: {body}");
     }
 
     let payload: TokenResponse = resp.json().context("auth: decode refresh response")?;
@@ -654,7 +655,8 @@ fn handle_redirect(req: tiny_http::Request, state: &str, tx: &Sender<AuthResult>
         return Ok(true);
     }
 
-    let url = Url::parse(&format!("http://dummy{}", req.url()))?;
+    let redirected_path = req.url();
+    let url = Url::parse(&format!("http://dummy{redirected_path}"))?;
     let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
     if params.get("state").map(String::as_str) != Some(state) {
         let _ = req.respond(Response::from_string("state mismatch").with_status_code(400));
@@ -671,7 +673,7 @@ fn handle_redirect(req: tiny_http::Request, state: &str, tx: &Sender<AuthResult>
         let _ = req.respond(Response::from_string("authorization denied").with_status_code(401));
         tx.send(AuthResult {
             code: None,
-            error: Some(anyhow!("authorization error: {} ({})", error, description)),
+            error: Some(anyhow!("authorization error: {error} ({description})")),
         })
         .ok();
         return Ok(true);
@@ -731,15 +733,15 @@ impl fmt::Display for TokenError {
             return write!(f, "unknown token error");
         }
         if self.description.is_empty() {
-            write!(f, "authorization error: {}", self.error)
+            let error = &self.error;
+            write!(f, "authorization error: {error}")
         } else if self.error.is_empty() {
-            write!(f, "authorization error: {}", self.description)
+            let description = &self.description;
+            write!(f, "authorization error: {description}")
         } else {
-            write!(
-                f,
-                "authorization error: {} ({})",
-                self.error, self.description
-            )
+            let error = &self.error;
+            let description = &self.description;
+            write!(f, "authorization error: {error} ({description})")
         }
     }
 }

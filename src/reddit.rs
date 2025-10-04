@@ -56,20 +56,15 @@ impl ListingOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOption {
+    #[default]
     Hot,
     New,
     Top,
     Best,
     Rising,
-}
-
-impl Default for SortOption {
-    fn default() -> Self {
-        SortOption::Hot
-    }
 }
 
 impl SortOption {
