@@ -31,4 +31,5 @@ Core shortcuts: `j/k` move, `h/l` change panes, `m` menu, `o` link menu, `r` ref
 
 ## Support
 - Feature requests and contributions are welcome, this project is in its very early stage.
+- Track ongoing ideas in the [feature request log](docs/feature-requests.md).
 - Donation: https://ko-fi.com/ckzhang
