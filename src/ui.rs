@@ -529,6 +529,13 @@ impl MenuForm {
         }
     }
 
+    fn active_accepts_text(&self) -> bool {
+        matches!(
+            self.active,
+            MenuField::ClientId | MenuField::ClientSecret | MenuField::UserAgent
+        )
+    }
+
     fn next(&mut self) {
         let has_copy = self.has_auth_link();
         self.active = self.active.next(has_copy);
@@ -2857,12 +2864,6 @@ impl Model {
         let mut dirty = false;
         match code {
             KeyCode::Char('q') => return Ok(true),
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                self.menu_visible = false;
-                self.status_message = "Guided menu closed.".to_string();
-                self.mark_dirty();
-                return Ok(false);
-            }
             KeyCode::Esc => {
                 self.menu_screen = MenuScreen::Accounts;
                 if let Err(err) = self.refresh_menu_accounts() {
@@ -2945,20 +2946,32 @@ impl Model {
                 self.menu_form.clear_active();
                 dirty = true;
             }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                if self.menu_form.has_auth_link() {
-                    if let Err(err) = self.copy_auth_link_to_clipboard() {
-                        let message = format!("Failed to copy authorization link: {err}");
-                        self.menu_form.set_status(message.clone());
-                        self.status_message = message;
-                    }
-                    dirty = true;
-                }
-            }
             KeyCode::Char(ch) => {
-                if !ch.is_control() {
-                    self.menu_form.insert_char(ch);
-                    dirty = true;
+                if self.menu_form.active_accepts_text() {
+                    if !ch.is_control() {
+                        self.menu_form.insert_char(ch);
+                        dirty = true;
+                    }
+                } else {
+                    match ch {
+                        'm' | 'M' => {
+                            self.menu_visible = false;
+                            self.status_message = "Guided menu closed.".to_string();
+                            self.mark_dirty();
+                            return Ok(false);
+                        }
+                        'c' | 'C' if self.menu_form.has_auth_link() => {
+                            if let Err(err) = self.copy_auth_link_to_clipboard() {
+                                let message = format!(
+                                    "Failed to copy authorization link: {err}"
+                                );
+                                self.menu_form.set_status(message.clone());
+                                self.status_message = message;
+                            }
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
