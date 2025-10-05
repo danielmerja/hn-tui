@@ -10,5 +10,8 @@ pub mod reddit;
 pub mod session;
 pub mod storage;
 pub mod ui;
+pub mod update;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use app::run;
