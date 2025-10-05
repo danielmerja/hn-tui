@@ -230,6 +230,30 @@ impl Client {
         Ok(())
     }
 
+    pub fn subscribe_subreddit(&self, subreddit: &str) -> Result<()> {
+        let name = subreddit.trim().trim_start_matches("r/");
+        if name.is_empty() {
+            bail!("reddit: subreddit name required");
+        }
+        let form = vec![
+            ("action".to_string(), "sub".to_string()),
+            ("sr_name".to_string(), name.to_string()),
+        ];
+        self.request(Method::POST, "/api/subscribe", &[], Some(form))?;
+        Ok(())
+    }
+
+    pub fn is_subscribed(&self, subreddit: &str) -> Result<bool> {
+        let name = subreddit.trim().trim_start_matches("r/");
+        if name.is_empty() {
+            bail!("reddit: subreddit name required");
+        }
+        let path = format!("/r/{}/about.json", name);
+        let resp = self.request(Method::GET, &path, &[], None)?;
+        let about: SubredditAboutEnvelope = resp.json()?;
+        Ok(about.data.user_is_subscriber)
+    }
+
     pub fn reply(&self, parent: &str, text: &str) -> Result<Comment> {
         if parent.trim().is_empty() {
             bail!("reddit: reply parent is required");
@@ -563,6 +587,17 @@ pub struct Subreddit {
     pub subscribers: i64,
     #[serde(default, rename = "over18")]
     pub over_18: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubredditAboutEnvelope {
+    data: SubredditAbout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubredditAbout {
+    #[serde(default)]
+    pub user_is_subscriber: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

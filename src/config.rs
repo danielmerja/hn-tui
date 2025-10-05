@@ -57,6 +57,7 @@ fn default_scopes() -> Vec<String> {
         "mysubreddits".into(),
         "read".into(),
         "vote".into(),
+        "subscribe".into(),
     ]
 }
 

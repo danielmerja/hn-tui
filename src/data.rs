@@ -33,6 +33,8 @@ pub trait InteractionService: Send + Sync {
     fn hide(&self, fullname: &str) -> Result<()>;
     fn unhide(&self, fullname: &str) -> Result<()>;
     fn reply(&self, parent: &str, text: &str) -> Result<reddit::Comment>;
+    fn subscribe(&self, subreddit: &str) -> Result<()>;
+    fn is_subscribed(&self, subreddit: &str) -> Result<bool>;
 }
 
 pub struct RedditSubredditService {
@@ -139,6 +141,14 @@ impl InteractionService for RedditInteractionService {
 
     fn unhide(&self, fullname: &str) -> Result<()> {
         self.client.unhide(fullname)
+    }
+
+    fn subscribe(&self, subreddit: &str) -> Result<()> {
+        self.client.subscribe_subreddit(subreddit)
+    }
+
+    fn is_subscribed(&self, subreddit: &str) -> Result<bool> {
+        self.client.is_subscribed(subreddit)
     }
 
     fn reply(&self, parent: &str, text: &str) -> Result<reddit::Comment> {
@@ -251,6 +261,14 @@ impl InteractionService for MockInteractionService {
 
     fn unhide(&self, _fullname: &str) -> Result<()> {
         Ok(())
+    }
+
+    fn subscribe(&self, _subreddit: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_subscribed(&self, _subreddit: &str) -> Result<bool> {
+        Ok(false)
     }
 
     fn reply(&self, _parent: &str, _text: &str) -> Result<reddit::Comment> {
