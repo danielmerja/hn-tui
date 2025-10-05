@@ -2863,7 +2863,6 @@ impl Model {
     fn handle_menu_credentials_key(&mut self, code: KeyCode) -> Result<bool> {
         let mut dirty = false;
         match code {
-            KeyCode::Char('q') => return Ok(true),
             KeyCode::Esc => {
                 self.menu_screen = MenuScreen::Accounts;
                 if let Err(err) = self.refresh_menu_accounts() {
@@ -2954,6 +2953,7 @@ impl Model {
                     }
                 } else {
                     match ch {
+                        'q' | 'Q' => return Ok(true),
                         'm' | 'M' => {
                             self.menu_visible = false;
                             self.status_message = "Guided menu closed.".to_string();
