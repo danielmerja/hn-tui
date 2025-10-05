@@ -1879,7 +1879,10 @@ impl Model {
             return Ok(());
         }
         if state.pending {
-            self.status_message = format!("Joining {} is already in progress...", REDDIX_COMMUNITY_DISPLAY);
+            self.status_message = format!(
+                "Joining {} is already in progress...",
+                REDDIX_COMMUNITY_DISPLAY
+            );
             self.mark_dirty();
             return Ok(());
         }
@@ -3579,7 +3582,10 @@ impl Model {
                     }
                     Err(err) => {
                         state.mark_error(err.to_string());
-                        self.status_message = format!("Checking {} subscription failed: {}", REDDIX_COMMUNITY_DISPLAY, err);
+                        self.status_message = format!(
+                            "Checking {} subscription failed: {}",
+                            REDDIX_COMMUNITY_DISPLAY, err
+                        );
                     }
                 }
                 self.mark_dirty();
@@ -3590,10 +3596,14 @@ impl Model {
                 match result {
                     Ok(()) => {
                         state.mark_success();
-                        self.status_message = format!("Joined {}. Thanks for supporting the community!", REDDIX_COMMUNITY_DISPLAY);
+                        self.status_message = format!(
+                            "Joined {}. Thanks for supporting the community!",
+                            REDDIX_COMMUNITY_DISPLAY
+                        );
                     }
                     Err(err) => {
-                        let message = format!("Joining {} failed: {}", REDDIX_COMMUNITY_DISPLAY, err);
+                        let message =
+                            format!("Joining {} failed: {}", REDDIX_COMMUNITY_DISPLAY, err);
                         state.mark_error(message.clone());
                         self.status_message = message;
                     }
@@ -4314,7 +4324,7 @@ impl Model {
         if base == 0 {
             return 0;
         }
-        if offset == 0 && self.update_notice.is_some() {
+        if self.update_notice.is_some() {
             base = base.saturating_sub(UPDATE_BANNER_HEIGHT);
         }
         if offset == 0 && self.pending_posts.is_some() && !self.posts.is_empty() {
@@ -5429,21 +5439,20 @@ impl Model {
 
         let loading_posts = self.pending_posts.is_some();
         let mut items: Vec<ListItem> = Vec::new();
-        if offset == 0 {
-            if let Some(update) = &self.update_notice {
-                let message = format!("Update available: {} -> {} (GitHub Releases)",
-                    self.current_version, update.version
-                );
-                let mut lines = vec![Line::from(Span::styled(
-                    message,
-                    Style::default()
-                        .fg(COLOR_ACCENT)
-                        .bg(COLOR_PANEL_BG)
-                        .add_modifier(Modifier::BOLD),
-                ))];
-                pad_lines_to_width(&mut lines, pane_width);
-                items.push(ListItem::new(lines));
-            }
+        if let Some(update) = &self.update_notice {
+            let message = format!(
+                "Update available: {} -> {} (GitHub Releases)",
+                self.current_version, update.version
+            );
+            let mut lines = vec![Line::from(Span::styled(
+                message,
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .bg(COLOR_PANEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))];
+            pad_lines_to_width(&mut lines, pane_width);
+            items.push(ListItem::new(lines));
         }
         let remaining_height = self.available_post_height(offset);
 
