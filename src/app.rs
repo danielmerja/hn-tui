@@ -34,7 +34,7 @@ pub fn run() -> Result<()> {
     let mut content = format!(
         "Open the guided menu with m, then press a to add a Reddit account.\n\nConfigure reddit.client_id, reddit.client_secret (optional), and reddit.redirect_uri in {display_path} before authorizing."
     );
-    let mut subreddits = vec![
+    let subreddits = vec![
         "r/frontpage".to_string(),
         "r/popular".to_string(),
         "r/programming".to_string(),
@@ -59,6 +59,7 @@ pub fn run() -> Result<()> {
     let mut interaction_service: Option<Arc<dyn data::InteractionService + Send + Sync>> = None;
 
     let mut session_manager: Option<Arc<session::Manager>> = None;
+    let mut fetch_subreddits_on_start = false;
 
     let login_ready = !cfg.reddit.client_id.trim().is_empty()
         && !cfg.reddit.user_agent.trim().is_empty()
@@ -107,16 +108,11 @@ pub fn run() -> Result<()> {
                                 let interaction_api: Arc<dyn InteractionService + Send + Sync> =
                                     Arc::new(data::RedditInteractionService::new(client.clone()));
 
-                                if let Ok(listing) = subreddit_api
-                                    .list_subreddits(reddit::SubredditSource::Subscriptions)
-                                {
-                                    subreddits = listing.into_iter().map(|s| s.name).collect();
-                                }
-
                                 feed_service = Some(feed_api);
                                 subreddit_service = Some(subreddit_api);
                                 comment_service = Some(comment_api);
                                 interaction_service = Some(interaction_api);
+                                fetch_subreddits_on_start = true;
                                 posts.clear();
                             }
                         }
@@ -154,6 +150,7 @@ pub fn run() -> Result<()> {
         config_path: display_path.clone(),
         store: store.clone(),
         session_manager: session_manager.clone(),
+        fetch_subreddits_on_start,
     };
 
     let mut model = ui::Model::new(options);

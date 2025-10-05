@@ -1720,6 +1720,7 @@ pub struct Options {
     pub config_path: String,
     pub store: Arc<storage::Store>,
     pub session_manager: Option<Arc<session::Manager>>,
+    pub fetch_subreddits_on_start: bool,
 }
 
 pub struct Model {
@@ -2315,6 +2316,12 @@ impl Model {
             model.status_message = format!("Failed to load posts: {err}");
             model.content = model.fallback_content.clone();
             model.content_source = model.fallback_source.clone();
+        }
+
+        if opts.fetch_subreddits_on_start {
+            if let Err(err) = model.reload_subreddits() {
+                model.status_message = format!("Failed to refresh subreddits: {err}");
+            }
         }
 
         model.ensure_post_visible();
