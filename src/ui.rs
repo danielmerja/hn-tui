@@ -75,6 +75,7 @@ const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
 const UPDATE_CHECK_DISABLE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
+const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
@@ -2197,8 +2198,7 @@ impl Model {
     }
 
     pub fn new(opts: Options) -> Self {
-        let current_version =
-            Version::parse(crate::VERSION).expect("crate version is valid semver");
+        let current_version = resolve_current_version();
         let markdown = markdown::Renderer::new();
         let fallback_content = markdown.render(&opts.content);
         let (response_tx, response_rx) = unbounded();
@@ -6396,6 +6396,37 @@ impl Model {
     }
 }
 
+fn resolve_current_version() -> Version {
+    let base = || Version::parse(crate::VERSION).expect("crate version is valid semver");
+
+    match env::var(CURRENT_VERSION_OVERRIDE_ENV) {
+        Ok(raw) => {
+            let candidate = raw.trim();
+            if candidate.is_empty() {
+                return base();
+            }
+            match Version::parse(candidate) {
+                Ok(version) => version,
+                Err(err) => {
+                    eprintln!(
+                        "Ignoring {}='{}': parse error {}",
+                        CURRENT_VERSION_OVERRIDE_ENV, raw, err
+                    );
+                    base()
+                }
+            }
+        }
+        Err(env::VarError::NotPresent) => base(),
+        Err(err) => {
+            eprintln!(
+                "Ignoring {} (failed to read env var): {}",
+                CURRENT_VERSION_OVERRIDE_ENV, err
+            );
+            base()
+        }
+    }
+}
+
 fn pane_constraints(panes: &[Pane; 3]) -> [Constraint; 3] {
     match panes {
         [Pane::Navigation, Pane::Posts, Pane::Content] => [
@@ -6429,12 +6460,36 @@ fn pane_constraints(panes: &[Pane; 3]) -> [Constraint; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     fn total_width(line: &Line<'_>) -> usize {
         line.spans
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum()
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn resolve_current_version_respects_override() {
+        let _guard = env_guard();
+        env::set_var(CURRENT_VERSION_OVERRIDE_ENV, "1.2.3");
+        let version = resolve_current_version();
+        env::remove_var(CURRENT_VERSION_OVERRIDE_ENV);
+        assert_eq!(version, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn resolve_current_version_falls_back_on_invalid_override() {
+        let _guard = env_guard();
+        env::set_var(CURRENT_VERSION_OVERRIDE_ENV, "not-a-version");
+        let version = resolve_current_version();
+        env::remove_var(CURRENT_VERSION_OVERRIDE_ENV);
+        assert_eq!(version, Version::parse(crate::VERSION).unwrap());
     }
 
     #[test]
