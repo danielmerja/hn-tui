@@ -282,6 +282,8 @@ struct ActiveKitty {
     post_name: String,
     image_id: u32,
     wrap_tmux: bool,
+    row: u16,
+    col: u16,
 }
 
 struct NumericJump {
@@ -5241,19 +5243,13 @@ impl Model {
         {
             self.emit_active_kitty_delete(backend)?;
         }
-        let Some(preview) = self.media_previews.get_mut(&post_name) else {
+        if !self.media_previews.contains_key(&post_name) {
             if self.active_kitty_matches(&post_name) {
                 self.emit_active_kitty_delete(backend)?;
             }
             return Ok(());
-        };
-        let Some(layout) = self.media_layouts.get(&post_name) else {
-            if self.active_kitty_matches(&post_name) {
-                self.emit_active_kitty_delete(backend)?;
-            }
-            return Ok(());
-        };
-        let Some(kitty) = preview.kitty_mut() else {
+        }
+        let Some(layout) = self.media_layouts.get(&post_name).copied() else {
             if self.active_kitty_matches(&post_name) {
                 self.emit_active_kitty_delete(backend)?;
             }
@@ -5283,6 +5279,25 @@ impl Model {
 
         let row = area.y + relative_row as u16;
         let col = area.x.saturating_add(layout.indent);
+
+        if self.active_kitty.as_ref().is_some_and(|active| {
+            active.post_name == post_name && (active.row != row || active.col != col)
+        }) {
+            self.emit_active_kitty_delete(backend)?;
+        }
+
+        let Some(preview) = self.media_previews.get_mut(&post_name) else {
+            if self.active_kitty_matches(&post_name) {
+                self.emit_active_kitty_delete(backend)?;
+            }
+            return Ok(());
+        };
+        let Some(kitty) = preview.kitty_mut() else {
+            if self.active_kitty_matches(&post_name) {
+                self.emit_active_kitty_delete(backend)?;
+            }
+            return Ok(());
+        };
 
         if kitty_debug_enabled() {
             eprintln!(
@@ -5317,6 +5332,8 @@ impl Model {
             post_name,
             image_id: kitty.id,
             wrap_tmux: kitty.wrap_tmux,
+            row,
+            col,
         });
 
         if requested_redraw {
