@@ -33,7 +33,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, Error as ReqwestError};
 use semver::Version;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
@@ -50,7 +50,7 @@ use crate::media;
 use crate::reddit;
 use crate::session;
 use crate::storage;
-use crate::update;
+use crate::update::{self, SKIP_UPDATE_ENV};
 use copypasta::{ClipboardContext, ClipboardProvider};
 
 const MAX_IMAGE_COLS: i32 = 40;
@@ -74,7 +74,6 @@ const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 
 const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
-const UPDATE_CHECK_DISABLE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
 const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
@@ -431,6 +430,7 @@ struct JoinState {
 struct MenuAccountPositions {
     add: usize,
     join: usize,
+    update: usize,
     github: usize,
     support: usize,
     total: usize,
@@ -1783,6 +1783,7 @@ pub struct Model {
     update_notice: Option<update::UpdateInfo>,
     update_check_in_progress: bool,
     update_checked: bool,
+    latest_known_version: Option<Version>,
     current_version: Version,
     store: Arc<storage::Store>,
     session_manager: Option<Arc<session::Manager>>,
@@ -1805,18 +1806,61 @@ impl Model {
         if self.update_checked || self.update_check_in_progress {
             return;
         }
-        if cfg!(test) || env::var(UPDATE_CHECK_DISABLE_ENV).is_ok() {
+        if env::var(SKIP_UPDATE_ENV).is_ok() {
             self.update_checked = true;
+            self.update_notice = None;
+            self.update_check_in_progress = false;
+            self.latest_known_version = Some(self.current_version.clone());
+            self.status_message = format!("Update check skipped: {SKIP_UPDATE_ENV} is set.");
+            self.mark_dirty();
+            return;
+        }
+        if cfg!(test) {
+            self.update_checked = true;
+            self.latest_known_version = Some(self.current_version.clone());
             return;
         }
         self.update_checked = true;
         self.update_check_in_progress = true;
+        self.latest_known_version = None;
+        self.mark_dirty();
         let tx = self.response_tx.clone();
         let version = self.current_version.clone();
         thread::spawn(move || {
             let result = update::check_for_update(&version);
             let _ = tx.send(AsyncResponse::Update { result });
         });
+    }
+
+    fn force_update_check(&mut self) {
+        self.update_check_in_progress = false;
+        self.update_checked = false;
+        self.update_notice = None;
+        self.latest_known_version = None;
+        self.status_message = "Checking for updates…".to_string();
+        self.mark_dirty();
+        self.queue_update_check();
+    }
+
+    fn version_summary(&self) -> String {
+        if self.update_check_in_progress {
+            return format!("v{} (checking updates…)", self.current_version);
+        }
+        if let Some(update) = &self.update_notice {
+            if update.version > self.current_version {
+                return format!("v{} → v{} available", self.current_version, update.version);
+            }
+        }
+        if let Some(latest) = &self.latest_known_version {
+            if latest > &self.current_version {
+                return format!("v{} → v{} available", self.current_version, latest);
+            }
+            return format!("v{} (latest)", self.current_version);
+        }
+        if self.update_checked {
+            return format!("v{} (latest status unknown)", self.current_version);
+        }
+        format!("v{} (update check pending)", self.current_version)
     }
 
     fn active_account_id(&self) -> Option<i64> {
@@ -1833,12 +1877,14 @@ impl Model {
     fn menu_account_positions(&self) -> MenuAccountPositions {
         let add = self.menu_accounts.len();
         let join = add + 1;
-        let github = join + 1;
+        let update = join + 1;
+        let github = update + 1;
         let support = github + 1;
         let total = support + 1;
         MenuAccountPositions {
             add,
             join,
+            update,
             github,
             support,
             total,
@@ -2261,6 +2307,7 @@ impl Model {
             update_notice: None,
             update_check_in_progress: false,
             update_checked: false,
+            latest_known_version: None,
             current_version: current_version.clone(),
             store: opts.store.clone(),
             session_manager: opts.session_manager.clone(),
@@ -2735,6 +2782,7 @@ impl Model {
         let option_count = positions.total;
         let add_index = positions.add;
         let join_index = positions.join;
+        let update_index = positions.update;
         let github_index = positions.github;
         let support_index = positions.support;
 
@@ -2790,6 +2838,8 @@ impl Model {
                     self.show_credentials_form()?;
                 } else if self.menu_account_index == join_index {
                     self.join_reddix_subreddit()?;
+                } else if self.menu_account_index == update_index {
+                    self.force_update_check();
                 } else if self.menu_account_index == github_index {
                     let _ = self.open_project_link();
                 } else if self.menu_account_index == support_index {
@@ -3560,14 +3610,22 @@ impl Model {
                 self.update_checked = true;
                 match result {
                     Ok(Some(info)) => {
+                        self.latest_known_version = Some(info.version.clone());
                         self.update_notice = Some(info);
                     }
                     Ok(None) => {
                         self.update_notice = None;
+                        self.latest_known_version = Some(self.current_version.clone());
                     }
                     Err(err) => {
                         self.update_notice = None;
-                        self.status_message = format!("Update check failed: {}", err);
+                        let mut message = format!("Update check failed: {}", err);
+                        if let Some(network_err) = err.downcast_ref::<ReqwestError>() {
+                            if network_err.is_connect() || network_err.is_timeout() {
+                                message = "Update check skipped: network unavailable.".to_string();
+                            }
+                        }
+                        self.status_message = message;
                     }
                 }
                 self.mark_dirty();
@@ -5093,12 +5151,18 @@ impl Model {
             ])
             .split(frame.size());
 
-        let status_text = if self.is_loading() {
+        let raw_status = if self.is_loading() {
             format!("{} {}", self.spinner.frame(), self.status_message)
                 .trim()
                 .to_string()
         } else {
             self.status_message.clone()
+        };
+        let version_status = format!("Reddix {}", self.version_summary());
+        let status_text = if raw_status.is_empty() {
+            version_status
+        } else {
+            format!("{raw_status} · {version_status}")
         };
         let status_line = Paragraph::new(status_text).style(
             Style::default()
@@ -6095,6 +6159,7 @@ impl Model {
         ]));
 
         lines.push(Line::default());
+        lines.push(Line::default());
         lines.push(Line::from(vec![Span::styled(
             "Stay in the loop with the community:".to_string(),
             Style::default().fg(COLOR_TEXT_SECONDARY),
@@ -6167,6 +6232,49 @@ impl Model {
             ),
         };
         lines.push(Line::from(vec![Span::styled(join_hint, join_hint_style)]));
+        lines.push(Line::default());
+        lines.push(Line::default());
+
+        let update_index = positions.update;
+        let update_selected = self.menu_account_index == update_index;
+        let update_indicator_style = Style::default().fg(if update_selected {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        });
+        let mut update_label_style = Style::default().fg(if update_selected {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        });
+        if update_selected {
+            update_label_style = update_label_style.add_modifier(Modifier::BOLD);
+        }
+        let has_update = self
+            .latest_known_version
+            .as_ref()
+            .is_some_and(|latest| latest > &self.current_version);
+        let summary_style = if has_update {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        } else {
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::ITALIC)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if update_selected { ">" } else { " " }.to_string(),
+                update_indicator_style,
+            ),
+            Span::raw(" "),
+            Span::styled("Re-run update check · ".to_string(), update_label_style),
+            Span::styled(format!("Reddix {}", self.version_summary()), summary_style),
+        ]));
+
+        lines.push(Line::default());
+        lines.push(Line::default());
 
         let github_index = positions.github;
         let support_index = positions.support;

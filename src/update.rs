@@ -6,6 +6,8 @@ use reqwest::StatusCode;
 use semver::Version;
 use serde::Deserialize;
 
+pub const SKIP_UPDATE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
+
 const RELEASES_URL: &str = "https://api.github.com/repos/ck-zhang/reddix/releases/latest";
 const FORCE_VERSION_ENV: &str = "REDDIX_FORCE_UPDATE_VERSION";
 const FORCE_URL_ENV: &str = "REDDIX_FORCE_UPDATE_URL";
