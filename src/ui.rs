@@ -75,6 +75,8 @@ const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
 const UPDATE_CHECK_DISABLE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
+const REDDIX_COMMUNITY: &str = "ReddixTUI";
+const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
     Color::Rgb(250, 179, 135),
     Color::Rgb(166, 227, 161),
@@ -418,6 +420,40 @@ struct MenuAccountEntry {
     is_active: bool,
 }
 
+#[derive(Default, Clone)]
+struct JoinState {
+    pending: bool,
+    joined: bool,
+    last_error: Option<String>,
+}
+
+struct MenuAccountPositions {
+    add: usize,
+    join: usize,
+    github: usize,
+    support: usize,
+    total: usize,
+}
+
+impl JoinState {
+    fn mark_pending(&mut self) {
+        self.pending = true;
+        self.last_error = None;
+    }
+
+    fn mark_success(&mut self) {
+        self.pending = false;
+        self.joined = true;
+        self.last_error = None;
+    }
+
+    fn mark_error(&mut self, message: String) {
+        self.pending = false;
+        self.joined = false;
+        self.last_error = Some(message);
+    }
+}
+
 impl MenuField {
     fn next(self, has_copy: bool) -> Self {
         match self {
@@ -693,6 +729,14 @@ enum AsyncResponse {
     },
     Update {
         result: Result<Option<update::UpdateInfo>>,
+    },
+    JoinStatus {
+        account_id: i64,
+        result: Result<bool>,
+    },
+    JoinCommunity {
+        account_id: i64,
+        result: Result<()>,
     },
     VoteResult {
         target: VoteTarget,
@@ -1733,6 +1777,7 @@ pub struct Model {
     link_menu_visible: bool,
     link_menu_items: Vec<LinkEntry>,
     link_menu_selected: usize,
+    join_states: HashMap<i64, JoinState>,
     update_notice: Option<update::UpdateInfo>,
     update_check_in_progress: bool,
     update_checked: bool,
@@ -1770,6 +1815,85 @@ impl Model {
             let result = update::check_for_update(&version);
             let _ = tx.send(AsyncResponse::Update { result });
         });
+    }
+
+    fn active_account_id(&self) -> Option<i64> {
+        self.session_manager
+            .as_ref()
+            .and_then(|manager| manager.active_account_id())
+    }
+
+    fn active_join_state(&self) -> Option<&JoinState> {
+        let account_id = self.active_account_id()?;
+        self.join_states.get(&account_id)
+    }
+
+    fn menu_account_positions(&self) -> MenuAccountPositions {
+        let add = self.menu_accounts.len();
+        let join = add + 1;
+        let github = join + 1;
+        let support = github + 1;
+        let total = support + 1;
+        MenuAccountPositions {
+            add,
+            join,
+            github,
+            support,
+            total,
+        }
+    }
+
+    fn queue_join_status_check(&mut self) {
+        let Some(service) = self.interaction_service.clone() else {
+            return;
+        };
+        let Some(account_id) = self.active_account_id() else {
+            return;
+        };
+        self.join_states.entry(account_id).or_default();
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let result = service.is_subscribed(REDDIX_COMMUNITY);
+            let _ = tx.send(AsyncResponse::JoinStatus { account_id, result });
+        });
+    }
+
+    fn join_reddix_subreddit(&mut self) -> Result<()> {
+        let Some(service) = self.interaction_service.clone() else {
+            self.status_message = format!("Sign in to join {}.", REDDIX_COMMUNITY_DISPLAY);
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        let Some(account_id) = self.active_account_id() else {
+            self.status_message = "Select an account before joining the community.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        let state = self.join_states.entry(account_id).or_default();
+        if state.joined {
+            self.status_message = format!("Already subscribed to {}.", REDDIX_COMMUNITY_DISPLAY);
+            self.mark_dirty();
+            return Ok(());
+        }
+        if state.pending {
+            self.status_message = format!("Joining {} is already in progress...", REDDIX_COMMUNITY_DISPLAY);
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        state.mark_pending();
+        self.status_message = format!("Joining {}…", REDDIX_COMMUNITY_DISPLAY);
+        self.mark_dirty();
+
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let result = service.subscribe(REDDIX_COMMUNITY);
+            let _ = tx.send(AsyncResponse::JoinCommunity { account_id, result });
+        });
+
+        Ok(())
     }
 
     fn account_display_name(account: &storage::Account) -> String {
@@ -1949,6 +2073,8 @@ impl Model {
         self.session_manager = Some(manager.clone());
         self.setup_authenticated_services()?;
 
+        self.join_states.entry(session.account.id).or_default();
+        self.queue_join_status_check();
         self.adopt_cache_scope(CacheScope::Account(session.account.id));
 
         self.refresh_menu_accounts().ok();
@@ -2127,6 +2253,7 @@ impl Model {
             link_menu_visible: false,
             link_menu_items: Vec::new(),
             link_menu_selected: 0,
+            join_states: HashMap::new(),
             update_notice: None,
             update_check_in_progress: false,
             update_checked: false,
@@ -2192,6 +2319,7 @@ impl Model {
 
         model.ensure_post_visible();
         model.queue_update_check();
+        model.queue_join_status_check();
         model
     }
 
@@ -2593,10 +2721,17 @@ impl Model {
     }
 
     fn handle_menu_accounts_key(&mut self, code: KeyCode) -> Result<bool> {
-        let option_count = self.menu_accounts.len().saturating_add(3);
-        let add_index = self.menu_accounts.len();
-        let github_index = add_index + 1;
-        let support_index = github_index + 1;
+        let positions = self.menu_account_positions();
+        let option_count = positions.total;
+        let add_index = positions.add;
+        let join_index = positions.join;
+        let github_index = positions.github;
+        let support_index = positions.support;
+
+        if option_count == 0 {
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Esc => {
@@ -2621,10 +2756,8 @@ impl Model {
                 self.mark_dirty();
             }
             KeyCode::End => {
-                if option_count > 0 {
-                    self.menu_account_index = option_count - 1;
-                    self.mark_dirty();
-                }
+                self.menu_account_index = option_count - 1;
+                self.mark_dirty();
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.menu_account_index = add_index;
@@ -2645,6 +2778,8 @@ impl Model {
                     }
                 } else if self.menu_account_index == add_index {
                     self.show_credentials_form()?;
+                } else if self.menu_account_index == join_index {
+                    self.join_reddix_subreddit()?;
                 } else if self.menu_account_index == github_index {
                     let _ = self.open_project_link();
                 } else if self.menu_account_index == support_index {
@@ -3148,6 +3283,11 @@ impl Model {
             }
         }
 
+        if let Some(account_id) = self.active_account_id() {
+            self.join_states.entry(account_id).or_default();
+            self.queue_join_status_check();
+        }
+
         self.mark_dirty();
         Ok(())
     }
@@ -3418,6 +3558,37 @@ impl Model {
                     Err(err) => {
                         self.update_notice = None;
                         self.status_message = format!("Update check failed: {}", err);
+                    }
+                }
+                self.mark_dirty();
+            }
+            AsyncResponse::JoinStatus { account_id, result } => {
+                let state = self.join_states.entry(account_id).or_default();
+                match result {
+                    Ok(joined) => {
+                        state.pending = false;
+                        state.joined = joined;
+                        state.last_error = None;
+                    }
+                    Err(err) => {
+                        state.mark_error(err.to_string());
+                        self.status_message = format!("Checking {} subscription failed: {}", REDDIX_COMMUNITY_DISPLAY, err);
+                    }
+                }
+                self.mark_dirty();
+            }
+            AsyncResponse::JoinCommunity { account_id, result } => {
+                let state = self.join_states.entry(account_id).or_default();
+                state.pending = false;
+                match result {
+                    Ok(()) => {
+                        state.mark_success();
+                        self.status_message = format!("Joined {}. Thanks for supporting the community!", REDDIX_COMMUNITY_DISPLAY);
+                    }
+                    Err(err) => {
+                        let message = format!("Joining {} failed: {}", REDDIX_COMMUNITY_DISPLAY, err);
+                        state.mark_error(message.clone());
+                        self.status_message = message;
                     }
                 }
                 self.mark_dirty();
@@ -5890,7 +6061,9 @@ impl Model {
             }
         }
 
-        let add_selected = self.menu_account_index == self.menu_accounts.len();
+        let positions = self.menu_account_positions();
+
+        let add_selected = self.menu_account_index == positions.add;
         let mut add_style = Style::default().fg(if add_selected {
             COLOR_ACCENT
         } else {
@@ -5904,8 +6077,83 @@ impl Model {
             Span::raw(" "),
             Span::styled("Add new account…".to_string(), add_style),
         ]));
-        let github_index = self.menu_accounts.len() + 1;
-        let support_index = github_index + 1;
+
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            "Stay in the loop with the community:".to_string(),
+            Style::default().fg(COLOR_TEXT_SECONDARY),
+        )]));
+        let join_index = positions.join;
+        let join_selected = self.menu_account_index == join_index;
+        let join_state = self.active_join_state();
+        let label = if join_state.is_some_and(|state| state.pending) {
+            "[ Joining r/ReddixTUI… ]"
+        } else if join_state.is_some_and(|state| state.joined) {
+            "[ Joined r/ReddixTUI ]"
+        } else {
+            "[ Join r/ReddixTUI ]"
+        };
+        let joined = join_state.is_some_and(|state| state.joined);
+        let join_indicator_style = Style::default().fg(if join_selected {
+            COLOR_ACCENT
+        } else if joined {
+            COLOR_SUCCESS
+        } else {
+            COLOR_TEXT_SECONDARY
+        });
+        let mut join_label_style = Style::default().fg(if joined {
+            COLOR_SUCCESS
+        } else if join_selected {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        });
+        if join_selected && !joined {
+            join_label_style = join_label_style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        } else {
+            join_label_style = join_label_style.add_modifier(Modifier::BOLD);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if join_selected { ">" } else { " " }.to_string(),
+                join_indicator_style,
+            ),
+            Span::raw(" "),
+            Span::styled(label.to_string(), join_label_style),
+        ]));
+
+        let (join_hint, join_hint_style) = match (join_state, self.active_account_id()) {
+            (Some(state), _) if state.last_error.is_some() => (
+                state.last_error.clone().unwrap(),
+                Style::default().fg(COLOR_ERROR),
+            ),
+            (Some(state), _) if state.pending => (
+                "Request sent… hang tight.".to_string(),
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            (Some(state), _) if state.joined => (
+                "Already subscribed. Thanks for supporting the community!".to_string(),
+                Style::default().fg(COLOR_SUCCESS),
+            ),
+            (_, Some(_)) => (
+                "Press Enter to subscribe using your active account.".to_string(),
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            _ => (
+                "Add an account to enable one-click subscribe.".to_string(),
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        };
+        lines.push(Line::from(vec![Span::styled(join_hint, join_hint_style)]));
+
+        let github_index = positions.github;
+        let support_index = positions.support;
 
         let github_selected = self.menu_account_index == github_index;
         let github_indicator_style = Style::default().fg(if github_selected {
