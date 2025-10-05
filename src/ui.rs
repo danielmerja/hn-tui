@@ -34,6 +34,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
+use semver::Version;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
@@ -49,6 +50,7 @@ use crate::media;
 use crate::reddit;
 use crate::session;
 use crate::storage;
+use crate::update;
 use copypasta::{ClipboardContext, ClipboardProvider};
 
 const MAX_IMAGE_COLS: i32 = 40;
@@ -72,6 +74,7 @@ const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 
 const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
+const UPDATE_CHECK_DISABLE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
     Color::Rgb(250, 179, 135),
     Color::Rgb(166, 227, 161),
@@ -123,6 +126,7 @@ const POST_PRELOAD_THRESHOLD: usize = 5;
 const COMMENT_CACHE_MAX: usize = 64;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const POST_LOADING_HEADER_HEIGHT: usize = 2;
+const UPDATE_BANNER_HEIGHT: usize = 1;
 const ICON_UPVOTES: &str = "";
 const ICON_COMMENTS: &str = "";
 const ICON_SUBREDDIT: &str = "";
@@ -686,6 +690,9 @@ enum AsyncResponse {
     },
     Login {
         result: Result<String>,
+    },
+    Update {
+        result: Result<Option<update::UpdateInfo>>,
     },
     VoteResult {
         target: VoteTarget,
@@ -1726,6 +1733,10 @@ pub struct Model {
     link_menu_visible: bool,
     link_menu_items: Vec<LinkEntry>,
     link_menu_selected: usize,
+    update_notice: Option<update::UpdateInfo>,
+    update_check_in_progress: bool,
+    update_checked: bool,
+    current_version: Version,
     store: Arc<storage::Store>,
     session_manager: Option<Arc<session::Manager>>,
     login_in_progress: bool,
@@ -1743,6 +1754,24 @@ pub struct Model {
 }
 
 impl Model {
+    fn queue_update_check(&mut self) {
+        if self.update_checked || self.update_check_in_progress {
+            return;
+        }
+        if cfg!(test) || env::var(UPDATE_CHECK_DISABLE_ENV).is_ok() {
+            self.update_checked = true;
+            return;
+        }
+        self.update_checked = true;
+        self.update_check_in_progress = true;
+        let tx = self.response_tx.clone();
+        let version = self.current_version.clone();
+        thread::spawn(move || {
+            let result = update::check_for_update(&version);
+            let _ = tx.send(AsyncResponse::Update { result });
+        });
+    }
+
     fn account_display_name(account: &storage::Account) -> String {
         if !account.display_name.trim().is_empty() {
             account.display_name.trim().to_string()
@@ -2038,6 +2067,8 @@ impl Model {
     }
 
     pub fn new(opts: Options) -> Self {
+        let current_version =
+            Version::parse(crate::VERSION).expect("crate version is valid semver");
         let markdown = markdown::Renderer::new();
         let fallback_content = markdown.render(&opts.content);
         let (response_tx, response_rx) = unbounded();
@@ -2096,6 +2127,10 @@ impl Model {
             link_menu_visible: false,
             link_menu_items: Vec::new(),
             link_menu_selected: 0,
+            update_notice: None,
+            update_check_in_progress: false,
+            update_checked: false,
+            current_version: current_version.clone(),
             store: opts.store.clone(),
             session_manager: opts.session_manager.clone(),
             login_in_progress: false,
@@ -2156,6 +2191,7 @@ impl Model {
         }
 
         model.ensure_post_visible();
+        model.queue_update_check();
         model
     }
 
@@ -3369,6 +3405,23 @@ impl Model {
                 }
                 self.mark_dirty();
             }
+            AsyncResponse::Update { result } => {
+                self.update_check_in_progress = false;
+                self.update_checked = true;
+                match result {
+                    Ok(Some(info)) => {
+                        self.update_notice = Some(info);
+                    }
+                    Ok(None) => {
+                        self.update_notice = None;
+                    }
+                    Err(err) => {
+                        self.update_notice = None;
+                        self.status_message = format!("Update check failed: {}", err);
+                    }
+                }
+                self.mark_dirty();
+            }
             AsyncResponse::VoteResult {
                 target,
                 requested,
@@ -4079,15 +4132,17 @@ impl Model {
     }
 
     fn available_post_height(&self, offset: usize) -> usize {
-        let base = self.post_view_height.get() as usize;
+        let mut base = self.post_view_height.get() as usize;
         if base == 0 {
             return 0;
         }
-        if offset == 0 && self.pending_posts.is_some() && !self.posts.is_empty() {
-            base.saturating_sub(POST_LOADING_HEADER_HEIGHT)
-        } else {
-            base
+        if offset == 0 && self.update_notice.is_some() {
+            base = base.saturating_sub(UPDATE_BANNER_HEIGHT);
         }
+        if offset == 0 && self.pending_posts.is_some() && !self.posts.is_empty() {
+            base = base.saturating_sub(POST_LOADING_HEADER_HEIGHT);
+        }
+        base
     }
 
     fn comment_item_height(&self, visible_index: usize) -> usize {
@@ -5196,6 +5251,22 @@ impl Model {
 
         let loading_posts = self.pending_posts.is_some();
         let mut items: Vec<ListItem> = Vec::new();
+        if offset == 0 {
+            if let Some(update) = &self.update_notice {
+                let message = format!("Update available: {} -> {} (GitHub Releases)",
+                    self.current_version, update.version
+                );
+                let mut lines = vec![Line::from(Span::styled(
+                    message,
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .bg(COLOR_PANEL_BG)
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                pad_lines_to_width(&mut lines, pane_width);
+                items.push(ListItem::new(lines));
+            }
+        }
         let remaining_height = self.available_post_height(offset);
 
         self.prepare_post_rows(width, score_width, comments_width);
