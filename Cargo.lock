@@ -1608,7 +1608,7 @@ checksum = "f2ff9a1f06a88b01621b7ae906ef0211290d1c8a168a15542486a8f61c0833b9"
 
 [[package]]
 name = "reddix"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "assert_cmd",
