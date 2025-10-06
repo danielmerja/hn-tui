@@ -5641,46 +5641,20 @@ impl Model {
             .padding(Padding::uniform(1))
     }
 
-    fn draw_subreddits(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let block = self.pane_block(Pane::Navigation);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let focused = self.focused_pane == Pane::Navigation;
-
-        let layout_chunks = if inner.height <= 4 {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(2), Constraint::Min(0)])
-                .split(inner)
+    fn sort_lines_for_width(&self, width: usize, focused: bool) -> Vec<Line<'static>> {
+        let is_selected = focused && matches!(self.nav_mode, NavMode::Sorts);
+        let spacing_style = if is_selected {
+            Style::default()
+                .bg(COLOR_PANEL_SELECTED_BG)
+                .fg(COLOR_TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2),
-                    Constraint::Length(2),
-                    Constraint::Min(0),
-                ])
-                .split(inner)
-        };
-        let sort_area = layout_chunks[0];
-        let instructions_area = if layout_chunks.len() > 2 {
-            Some(layout_chunks[1])
-        } else {
-            None
-        };
-        let list_area = if instructions_area.is_some() {
-            layout_chunks[2]
-        } else {
-            layout_chunks[1]
+            Style::default().fg(COLOR_TEXT_SECONDARY)
         };
 
-        let mut sort_spans: Vec<Span> = Vec::with_capacity(NAV_SORTS.len() * 2);
+        let mut entries = Vec::with_capacity(NAV_SORTS.len());
         for (idx, sort) in NAV_SORTS.iter().enumerate() {
-            if idx > 0 {
-                sort_spans.push(Span::raw("  "));
-            }
             let is_active = self.sort == *sort;
-            let is_selected = focused && matches!(self.nav_mode, NavMode::Sorts);
             let mut style = Style::default().fg(if is_active {
                 COLOR_ACCENT
             } else {
@@ -5694,18 +5668,79 @@ impl Model {
             }
             let marker = if is_active { "●" } else { "○" };
             let number = idx + 1;
-            let label = format!("{} {} {}", number, marker, sort_label(*sort));
-            sort_spans.push(Span::styled(label, style));
+            let label = format!("{number} {marker} {}", sort_label(*sort));
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            entries.push((label, style, label_width));
         }
-        let sort_lines = vec![
-            Line::from(vec![Span::styled(
-                "Sort",
-                Style::default()
-                    .fg(COLOR_TEXT_SECONDARY)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(sort_spans),
-        ];
+
+        let available_width = width.max(1);
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        let mut current_line: Vec<Span> = Vec::new();
+        let mut current_width = 0usize;
+
+        for (label, style, label_width) in entries.into_iter() {
+            let spacing_width = if current_line.is_empty() { 0 } else { 2 };
+            if !current_line.is_empty()
+                && current_width + spacing_width + label_width > available_width
+            {
+                lines.push(current_line);
+                current_line = Vec::new();
+                current_width = 0;
+            }
+            if !current_line.is_empty() {
+                current_line.push(Span::styled("  ".to_string(), spacing_style));
+                current_width += spacing_width;
+            }
+            current_line.push(Span::styled(label, style));
+            current_width += label_width;
+        }
+
+        if current_line.is_empty() {
+            current_line.push(Span::raw(""));
+        }
+        lines.push(current_line);
+
+        let mut output = Vec::with_capacity(lines.len() + 1);
+        output.push(Line::from(vec![Span::styled(
+            "Sort",
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        output.extend(lines.into_iter().map(Line::from));
+        output
+    }
+
+    fn draw_subreddits(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let block = self.pane_block(Pane::Navigation);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let focused = self.focused_pane == Pane::Navigation;
+
+        let available_width = inner.width.max(1) as usize;
+        let sort_lines = self.sort_lines_for_width(available_width, focused);
+        let sort_height = sort_lines.len() as u16;
+
+        let instructions_height = if inner.height > sort_height + 2 { 2 } else { 0 };
+
+        let mut constraints = Vec::with_capacity(3);
+        constraints.push(Constraint::Length(sort_height));
+        if instructions_height > 0 {
+            constraints.push(Constraint::Length(instructions_height));
+        }
+        constraints.push(Constraint::Min(0));
+
+        let layout_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        let sort_area = layout_chunks[0];
+        let (instructions_area, list_area) = if instructions_height > 0 {
+            (Some(layout_chunks[1]), layout_chunks[2])
+        } else {
+            (None, layout_chunks[1])
+        };
 
         let sorts_paragraph = Paragraph::new(Text::from(sort_lines))
             .alignment(Alignment::Left)
@@ -5722,9 +5757,9 @@ impl Model {
                 )]),
                 Line::from(vec![Span::styled(
                     "h/l or ←/→ switch panes · j/k move within the list (press k on first row to reach sort) · digits/Enter load selection",
-                    Style::default().fg(COLOR_TEXT_SECONDARY),
-                )]),
-            ]))
+                Style::default().fg(COLOR_TEXT_SECONDARY),
+            )]),
+        ]))
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: true });
             frame.render_widget(instructions, area);
