@@ -1770,6 +1770,9 @@ pub struct Model {
     comment_view_height: Cell<u16>,
     comment_view_width: Cell<u16>,
     comment_status_height: Cell<usize>,
+    subreddit_offset: Cell<usize>,
+    subreddit_view_height: Cell<u16>,
+    subreddit_view_width: Cell<u16>,
     nav_index: usize,
     nav_mode: NavMode,
     content_scroll: u16,
@@ -2202,6 +2205,7 @@ impl Model {
             "r/popular".to_string(),
         ];
         self.selected_sub = 0;
+        self.subreddit_offset.set(0);
         let nav_len = NAV_SORTS.len().saturating_add(self.subreddits.len());
         if nav_len > 0 {
             let desired = NAV_SORTS.len().saturating_add(self.selected_sub);
@@ -2211,6 +2215,7 @@ impl Model {
             self.nav_index = 0;
             self.nav_mode = NavMode::Sorts;
         }
+        self.ensure_subreddit_visible();
     }
 
     fn scoped_comment_cache_mut(&mut self, key: &str) -> Option<&mut CommentCacheEntry> {
@@ -2423,6 +2428,9 @@ impl Model {
             comment_view_height: Cell::new(0),
             comment_view_width: Cell::new(0),
             comment_status_height: Cell::new(0),
+            subreddit_offset: Cell::new(0),
+            subreddit_view_height: Cell::new(0),
+            subreddit_view_width: Cell::new(0),
             nav_index: 0,
             nav_mode: NavMode::Subreddits,
             content_scroll: 0,
@@ -2505,6 +2513,7 @@ impl Model {
             model.nav_index = 0;
             model.nav_mode = NavMode::Sorts;
         }
+        model.ensure_subreddit_visible();
 
         if let Err(err) = model.reload_posts() {
             model.status_message = format!("Failed to load posts: {err}");
@@ -3689,6 +3698,7 @@ impl Model {
                             .selected_sub
                             .min(self.subreddits.len().saturating_sub(1));
                         self.nav_mode = NavMode::Subreddits;
+                        self.ensure_subreddit_visible();
                         self.status_message = "Subreddits refreshed".to_string();
                         if let Err(err) = self.reload_posts() {
                             self.status_message = format!("Failed to reload posts: {err}");
@@ -3949,6 +3959,7 @@ impl Model {
                         self.nav_index = self
                             .selected_sub
                             .min(self.subreddits.len().saturating_sub(1));
+                        self.ensure_subreddit_visible();
                         self.status_message =
                             "Use j/k inside the list, Enter to load; press k on the first subreddit to return to sort.".to_string();
                     }
@@ -3970,6 +3981,7 @@ impl Model {
                         );
                     } else if next != current {
                         self.nav_index = next as usize;
+                        self.ensure_subreddit_visible();
                         if let Some(name) = self.subreddits.get(self.nav_index) {
                             self.status_message = format!(
                                 "Highlighted {} · {} — press Enter to load.",
@@ -4384,10 +4396,84 @@ impl Model {
                 self.nav_index = 0;
             }
             self.nav_mode = NavMode::Subreddits;
+            self.ensure_subreddit_visible();
             true
         } else {
             false
         }
+    }
+
+    fn ensure_subreddit_visible(&self) {
+        let len = self.subreddits.len();
+        if len == 0 {
+            self.subreddit_offset.set(0);
+            return;
+        }
+
+        let target = self.nav_index.min(len - 1);
+        let viewport_height = self.subreddit_view_height.get() as usize;
+        if viewport_height == 0 {
+            self.subreddit_offset.set(target);
+            return;
+        }
+
+        let width = self.subreddit_view_width.get().max(1) as usize;
+        let mut prefix = vec![0usize; target.saturating_add(1) + 1];
+        for idx in 0..=target {
+            let height = self.subreddit_item_height(idx, width);
+            prefix[idx + 1] = prefix[idx].saturating_add(height);
+        }
+
+        let selection_height = self.subreddit_item_height(target, width);
+        let total_to_selection = prefix[target + 1];
+        let lower_bound = (viewport_height as f32) * 0.25;
+        let upper_bound = (viewport_height as f32) * 0.75;
+        let midpoint = (viewport_height as f32) * 0.5;
+
+        let mut best_choice: Option<(usize, f32)> = None;
+        let mut fallback_choice: Option<(usize, f32)> = None;
+
+        for (candidate, start) in prefix.iter().take(target + 1).enumerate() {
+            let bottom = total_to_selection.saturating_sub(*start);
+            if bottom > viewport_height {
+                continue;
+            }
+            let top = bottom.saturating_sub(selection_height);
+            let center = top as f32 + (selection_height as f32 / 2.0);
+            let diff = (center - midpoint).abs();
+
+            if center >= lower_bound && center <= upper_bound {
+                match best_choice {
+                    Some((_, best_diff)) if diff >= best_diff => {}
+                    _ => best_choice = Some((candidate, diff)),
+                }
+            }
+
+            match fallback_choice {
+                Some((_, best_diff)) if diff >= best_diff => {}
+                _ => fallback_choice = Some((candidate, diff)),
+            }
+        }
+
+        let chosen = best_choice
+            .or(fallback_choice)
+            .map(|(candidate, _)| candidate)
+            .unwrap_or(target);
+
+        self.subreddit_offset.set(chosen);
+    }
+
+    fn subreddit_item_height(&self, index: usize, width: usize) -> usize {
+        let Some(name) = self.subreddits.get(index) else {
+            return 1;
+        };
+
+        let style = Style::default();
+        let mut height = wrap_plain(name, width, style).len().saturating_add(1);
+        if height == 0 {
+            height = 1;
+        }
+        height
     }
 
     fn ensure_post_visible(&self) {
@@ -5555,7 +5641,7 @@ impl Model {
             .padding(Padding::uniform(1))
     }
 
-    fn draw_subreddits(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_subreddits(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = self.pane_block(Pane::Navigation);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -5644,9 +5730,16 @@ impl Model {
             frame.render_widget(instructions, area);
         }
 
+        self.subreddit_view_height.set(list_area.height);
+        self.subreddit_view_width.set(list_area.width);
+        self.ensure_subreddit_visible();
+
         let width = list_area.width.max(1) as usize;
+        let max_visible_height = list_area.height as usize;
+        let offset = self.subreddit_offset.get().min(self.subreddits.len());
+        let mut used_height = 0usize;
         let mut items: Vec<ListItem> = Vec::with_capacity(self.subreddits.len().max(1));
-        for (idx, name) in self.subreddits.iter().enumerate() {
+        for (idx, name) in self.subreddits.iter().enumerate().skip(offset) {
             let is_selected =
                 focused && matches!(self.nav_mode, NavMode::Subreddits) && self.nav_index == idx;
             let is_active = self.selected_sub == idx;
@@ -5671,7 +5764,11 @@ impl Model {
                 Style::default().bg(background),
             )));
             pad_lines_to_width(&mut lines, list_area.width);
+            used_height = used_height.saturating_add(lines.len());
             items.push(ListItem::new(lines));
+            if max_visible_height > 0 && used_height >= max_visible_height {
+                break;
+            }
         }
 
         if items.is_empty() {
