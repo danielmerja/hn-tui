@@ -15,6 +15,7 @@ This document tracks community requests and ideas for future Reddix releases.
 - Improve small-screen image display for cramped terminals.
 - Add link yanking so numbered hints jump to external open actions.
 - Support additional inline image protocols beyond kitty graphics.
+- Restore optional clipboard copy for outbound links.
 
 ## Completed Requests
 
