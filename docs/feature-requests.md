@@ -11,6 +11,10 @@ This document tracks community requests and ideas for future Reddix releases.
 - Comment pane keyword search.
 - Cleaner feed metadata presentation.
 - Shortcut customization for non-QWERTY layouts.
+- Comment creation support in the TUI.
+- Improve small-screen image display for cramped terminals.
+- Add link yanking so numbered hints jump to external open actions.
+- Support additional inline image protocols beyond kitty graphics.
 
 ## Completed Requests
 
