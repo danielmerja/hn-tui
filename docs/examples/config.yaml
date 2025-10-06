@@ -1,0 +1,27 @@
+# Sample Reddix configuration. Copy to:
+#   Windows: %APPDATA%/Reddix/config.yaml
+#   macOS/Linux: $XDG_CONFIG_HOME/reddix/config.yaml (defaults to ~/.config/reddix/config.yaml)
+reddit:
+  client_id: "your-client-id"
+  client_secret: "your-client-secret"
+  user_agent: "reddix/0.1 (+https://github.com/ck-zhang/reddix)"
+  scopes:
+    - identity
+    - mysubreddits
+    - read
+    - vote
+    - subscribe
+  redirect_uri: "http://127.0.0.1:65010/reddix/callback"
+ui:
+  theme: default
+media:
+  cache_dir: null
+  max_size_bytes: 524288000
+  default_ttl: "6h"
+  workers: 2
+player:
+  video_command:
+    - mpv
+    - --fs
+    - "%URL%"
+  video_detach: true
