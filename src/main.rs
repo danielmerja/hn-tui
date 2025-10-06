@@ -48,8 +48,12 @@ fn check_updates_once() -> anyhow::Result<()> {
     let current = Version::parse(reddix::VERSION)?;
     match reddix::update::check_for_update(&current)? {
         Some(info) => {
-            let reddix::update::UpdateInfo { version, url } = info;
-            println!("Update available: {current} -> {version}\n{url}");
+            let reddix::update::UpdateInfo {
+                version,
+                release_url,
+                ..
+            } = info;
+            println!("Update available: {current} -> {version}\n{release_url}");
         }
         None => {
             println!("Reddix {current} is up to date.");

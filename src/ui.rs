@@ -127,7 +127,7 @@ const POST_PRELOAD_THRESHOLD: usize = 5;
 const COMMENT_CACHE_MAX: usize = 64;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const POST_LOADING_HEADER_HEIGHT: usize = 2;
-const UPDATE_BANNER_HEIGHT: usize = 1;
+const UPDATE_BANNER_HEIGHT: usize = 2;
 const ICON_UPVOTES: &str = "";
 const ICON_COMMENTS: &str = "";
 const ICON_SUBREDDIT: &str = "";
@@ -431,7 +431,8 @@ struct JoinState {
 struct MenuAccountPositions {
     add: usize,
     join: usize,
-    update: usize,
+    update_check: usize,
+    install: Option<usize>,
     github: usize,
     support: usize,
     total: usize,
@@ -738,6 +739,9 @@ enum AsyncResponse {
     },
     Update {
         result: Result<Option<update::UpdateInfo>>,
+    },
+    UpdateInstall {
+        result: Result<()>,
     },
     JoinStatus {
         account_id: i64,
@@ -1791,6 +1795,9 @@ pub struct Model {
     update_notice: Option<update::UpdateInfo>,
     update_check_in_progress: bool,
     update_checked: bool,
+    update_install_in_progress: bool,
+    update_banner_selected: bool,
+    update_install_finished: bool,
     latest_known_version: Option<Version>,
     current_version: Version,
     store: Arc<storage::Store>,
@@ -1831,6 +1838,7 @@ impl Model {
         self.update_checked = true;
         self.update_check_in_progress = true;
         self.latest_known_version = None;
+        self.update_install_finished = false;
         self.mark_dirty();
         let tx = self.response_tx.clone();
         let version = self.current_version.clone();
@@ -1844,15 +1852,120 @@ impl Model {
         self.update_check_in_progress = false;
         self.update_checked = false;
         self.update_notice = None;
+        self.update_banner_selected = false;
         self.latest_known_version = None;
+        self.update_install_finished = false;
         self.status_message = "Checking for updates…".to_string();
         self.mark_dirty();
         self.queue_update_check();
     }
 
+    fn has_update_banner(&self) -> bool {
+        self.update_notice.is_some()
+    }
+
+    fn banner_selected(&self) -> bool {
+        self.has_update_banner() && self.update_banner_selected
+    }
+
+    fn post_list_len(&self) -> usize {
+        self.posts
+            .len()
+            .saturating_add(if self.has_update_banner() { 1 } else { 0 })
+    }
+
+    fn current_post_cursor(&self) -> usize {
+        if self.banner_selected() {
+            0
+        } else if self.has_update_banner() {
+            self.selected_post.saturating_add(1)
+        } else {
+            self.selected_post
+        }
+    }
+
+    fn set_post_cursor(&mut self, cursor: usize) {
+        if self.has_update_banner() {
+            if cursor == 0 {
+                if !self.update_banner_selected {
+                    self.update_banner_selected = true;
+                    self.post_offset.set(0);
+                    self.dismiss_link_menu(None);
+                    if let Some(update) = &self.update_notice {
+                        if self.update_install_finished {
+                            self.status_message = format!(
+                                "Update v{} installed. Restart Reddix to use the new version.",
+                                update.version
+                            );
+                        } else if self.update_install_in_progress {
+                            self.status_message = format!(
+                                "Installing update v{}… you can keep browsing while it finishes.",
+                                update.version
+                            );
+                        } else {
+                            self.status_message = format!(
+                                "Update {} available — press Enter or Shift+U to install now.",
+                                update.version
+                            );
+                        }
+                    } else {
+                        self.status_message =
+                            "Update status unavailable. Try re-running the check.".to_string();
+                    }
+                    self.mark_dirty();
+                }
+                return;
+            }
+            self.update_banner_selected = false;
+            let idx = cursor.saturating_sub(1);
+            self.select_post_at(idx);
+        } else {
+            self.update_banner_selected = false;
+            self.select_post_at(cursor);
+        }
+    }
+
+    fn install_update(&mut self) -> Result<()> {
+        if self.update_install_in_progress {
+            self.status_message =
+                "Update install already in progress. Hang tight for completion.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let Some(info) = self.update_notice.clone() else {
+            self.status_message =
+                "No update available. Trigger a fresh check to look for new releases.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        self.update_install_in_progress = true;
+        self.update_install_finished = false;
+        self.status_message = format!("Installing update v{}…", info.version);
+        self.mark_dirty();
+
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let result = update::install_update(&info);
+            let _ = tx.send(AsyncResponse::UpdateInstall { result });
+        });
+
+        Ok(())
+    }
+
     fn version_summary(&self) -> String {
         if self.update_check_in_progress {
             return format!("v{} (checking updates…)", self.current_version);
+        }
+        if self.update_install_in_progress {
+            if let Some(update) = &self.update_notice {
+                return format!(
+                    "v{} → v{} installing…",
+                    self.current_version, update.version
+                );
+            }
+            return format!("v{} (installing update…)", self.current_version);
         }
         if let Some(update) = &self.update_notice {
             if update.version > self.current_version {
@@ -1883,16 +1996,30 @@ impl Model {
     }
 
     fn menu_account_positions(&self) -> MenuAccountPositions {
-        let add = self.menu_accounts.len();
-        let join = add + 1;
-        let update = join + 1;
-        let github = update + 1;
-        let support = github + 1;
-        let total = support + 1;
+        let mut next = self.menu_accounts.len();
+        let add = next;
+        next += 1;
+        let join = next;
+        next += 1;
+        let update_check = next;
+        next += 1;
+        let install = if self.update_notice.is_some() {
+            let idx = next;
+            next += 1;
+            Some(idx)
+        } else {
+            None
+        };
+        let github = next;
+        next += 1;
+        let support = next;
+        next += 1;
+        let total = next;
         MenuAccountPositions {
             add,
             join,
-            update,
+            update_check,
+            install,
             github,
             support,
             total,
@@ -1982,8 +2109,14 @@ impl Model {
                 is_active: active_id == Some(account.id),
             })
             .collect();
-        let max_index = self.menu_accounts.len().saturating_add(2);
-        self.menu_account_index = self.menu_account_index.min(max_index);
+        let positions = self.menu_account_positions();
+        if positions.total == 0 {
+            self.menu_account_index = 0;
+        } else {
+            self.menu_account_index = self
+                .menu_account_index
+                .min(positions.total.saturating_sub(1));
+        }
         Ok(())
     }
 
@@ -2315,6 +2448,9 @@ impl Model {
             update_notice: None,
             update_check_in_progress: false,
             update_checked: false,
+            update_install_in_progress: false,
+            update_banner_selected: false,
+            update_install_finished: false,
             latest_known_version: None,
             current_version: current_version.clone(),
             store: opts.store.clone(),
@@ -2543,10 +2679,17 @@ impl Model {
                 dirty = true;
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
-                self.open_link_menu();
+                if self.banner_selected() {
+                    self.status_message = "Select a post first to open its links.".to_string();
+                    dirty = true;
+                } else {
+                    self.open_link_menu();
+                }
             }
             KeyCode::Char('u') => {
-                if self.focused_pane == Pane::Comments {
+                if self.banner_selected() {
+                    self.status_message = "Select a post before voting.".to_string();
+                } else if self.focused_pane == Pane::Comments {
                     let new_dir = self
                         .selected_comment_index()
                         .and_then(|idx| self.comments.get(idx))
@@ -2564,8 +2707,14 @@ impl Model {
                 }
                 dirty = true;
             }
+            KeyCode::Char('U') => {
+                self.install_update()?;
+                dirty = true;
+            }
             KeyCode::Char('d') => {
-                if self.focused_pane == Pane::Comments {
+                if self.banner_selected() {
+                    self.status_message = "Select a post before voting.".to_string();
+                } else if self.focused_pane == Pane::Comments {
                     let new_dir = self
                         .selected_comment_index()
                         .and_then(|idx| self.comments.get(idx))
@@ -2598,6 +2747,9 @@ impl Model {
             KeyCode::Enter => {
                 if self.focused_pane == Pane::Navigation {
                     self.commit_navigation_selection()?;
+                    dirty = true;
+                } else if self.focused_pane == Pane::Posts && self.banner_selected() {
+                    self.install_update()?;
                     dirty = true;
                 }
             }
@@ -2790,7 +2942,8 @@ impl Model {
         let option_count = positions.total;
         let add_index = positions.add;
         let join_index = positions.join;
-        let update_index = positions.update;
+        let update_index = positions.update_check;
+        let install_index = positions.install;
         let github_index = positions.github;
         let support_index = positions.support;
 
@@ -2848,6 +3001,8 @@ impl Model {
                     self.join_reddix_subreddit()?;
                 } else if self.menu_account_index == update_index {
                     self.force_update_check();
+                } else if install_index.is_some_and(|idx| self.menu_account_index == idx) {
+                    self.install_update()?;
                 } else if self.menu_account_index == github_index {
                     let _ = self.open_project_link();
                 } else if self.menu_account_index == support_index {
@@ -3605,14 +3760,24 @@ impl Model {
                 match result {
                     Ok(Some(info)) => {
                         self.latest_known_version = Some(info.version.clone());
-                        self.update_notice = Some(info);
+                        self.update_notice = Some(info.clone());
+                        self.update_banner_selected = true;
+                        self.update_install_finished = false;
+                        self.status_message = format!(
+                            "Update {} available — press Enter or Shift+U to install now.",
+                            info.version
+                        );
                     }
                     Ok(None) => {
                         self.update_notice = None;
                         self.latest_known_version = Some(self.current_version.clone());
+                        self.update_banner_selected = false;
+                        self.update_install_finished = false;
                     }
                     Err(err) => {
                         self.update_notice = None;
+                        self.update_banner_selected = false;
+                        self.update_install_finished = false;
                         let mut message = format!("Update check failed: {}", err);
                         if let Some(network_err) = err.downcast_ref::<ReqwestError>() {
                             if network_err.is_connect() || network_err.is_timeout() {
@@ -3620,6 +3785,31 @@ impl Model {
                             }
                         }
                         self.status_message = message;
+                    }
+                }
+                self.mark_dirty();
+            }
+            AsyncResponse::UpdateInstall { result } => {
+                self.update_install_in_progress = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(update) = &self.update_notice {
+                            self.status_message = format!(
+                                "Update v{} installed. Restart Reddix to finish applying it.",
+                                update.version
+                            );
+                        } else {
+                            self.status_message =
+                                "Update installed. Restart Reddix to finish applying it."
+                                    .to_string();
+                        }
+                        self.update_banner_selected = false;
+                        self.update_install_finished = true;
+                    }
+                    Err(err) => {
+                        self.status_message = format!("Update install failed: {}", err);
+                        self.update_banner_selected = false;
+                        self.update_install_finished = false;
                     }
                 }
                 self.mark_dirty();
@@ -3791,13 +3981,19 @@ impl Model {
                 }
             },
             Pane::Posts => {
-                if self.posts.is_empty() {
+                let len = self.post_list_len();
+                if len == 0 {
                     return Ok(());
                 }
-                let len = self.posts.len() as i32;
-                let current = self.selected_post as i32;
+                let len = len as i32;
+                let current = self.current_post_cursor() as i32;
                 let next = (current + delta).clamp(0, len.saturating_sub(1));
-                self.select_post_at(next as usize);
+                if next != current {
+                    self.set_post_cursor(next as usize);
+                }
+                if self.banner_selected() {
+                    self.selected_post = self.selected_post.min(self.posts.len().saturating_sub(1));
+                }
             }
             Pane::Content => {
                 if delta > 0 {
@@ -4107,6 +4303,7 @@ impl Model {
         if self.posts.is_empty() {
             self.selected_post = 0;
             self.post_offset.set(0);
+            self.update_banner_selected = false;
             return;
         }
 
@@ -4114,6 +4311,7 @@ impl Model {
         let clamped = index.min(max_index);
         let changed = clamped != self.selected_post;
 
+        self.update_banner_selected = false;
         self.selected_post = clamped;
         if changed {
             self.queue_active_kitty_delete();
@@ -5513,21 +5711,69 @@ impl Model {
         let loading_posts = self.pending_posts.is_some();
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(update) = &self.update_notice {
-            let message = format!(
-                "Update available: {} -> {} (GitHub Releases)",
-                self.current_version, update.version
-            );
-            let mut lines = vec![Line::from(Span::styled(
-                message,
-                Style::default()
-                    .fg(COLOR_ACCENT)
-                    .bg(COLOR_PANEL_BG)
-                    .add_modifier(Modifier::BOLD),
-            ))];
+            let installing = self.update_install_in_progress;
+            let message = if installing {
+                format!(
+                    "Installing update: {} → {} (GitHub Releases)",
+                    self.current_version, update.version
+                )
+            } else {
+                format!(
+                    "Update available: {} → {} (GitHub Releases)",
+                    self.current_version, update.version
+                )
+            };
+            let focused = self.focused_pane == Pane::Posts;
+            let selected = self.banner_selected();
+            let highlight = focused && selected;
+            let background = if highlight {
+                COLOR_PANEL_SELECTED_BG
+            } else {
+                COLOR_PANEL_BG
+            };
+            let mut line_style = Style::default()
+                .fg(COLOR_ACCENT)
+                .bg(background)
+                .add_modifier(Modifier::BOLD);
+            if installing {
+                line_style = line_style.add_modifier(Modifier::ITALIC);
+            }
+            let mut lines = vec![Line::from(Span::styled(message, line_style))];
+            let detail_text = if installing {
+                "Installer running… you can keep browsing while it finishes."
+            } else if self.update_install_finished {
+                "Update installed. Restart Reddix to use the new version."
+            } else if highlight {
+                "Press Enter to install now · Shift+U works anywhere."
+            } else {
+                "Select and press Enter to install."
+            };
+            let mut detail_style = Style::default().bg(background);
+            detail_style = detail_style.fg(if highlight {
+                COLOR_TEXT_PRIMARY
+            } else {
+                COLOR_TEXT_SECONDARY
+            });
+            detail_style = detail_style.add_modifier(Modifier::ITALIC);
+            if installing {
+                detail_style = detail_style.fg(COLOR_ACCENT);
+            }
+            lines.push(Line::from(Span::styled(
+                detail_text.to_string(),
+                detail_style,
+            )));
+            lines.push(Line::from(Span::styled(
+                String::new(),
+                Style::default().bg(background),
+            )));
             pad_lines_to_width(&mut lines, pane_width);
             items.push(ListItem::new(lines));
         }
-        let remaining_height = self.available_post_height(offset);
+        let remaining_height = if self.banner_selected() {
+            self.available_post_height(offset.saturating_sub(1))
+        } else {
+            self.available_post_height(offset)
+        };
 
         self.prepare_post_rows(width, score_width, comments_width);
 
@@ -5551,7 +5797,7 @@ impl Model {
         let mut used_height = 0usize;
         for (idx, item) in self.posts.iter().enumerate().skip(offset) {
             let focused = self.focused_pane == Pane::Posts;
-            let selected = idx == self.selected_post;
+            let selected = idx == self.selected_post && !self.banner_selected();
             let highlight = focused && selected;
             let background = if highlight {
                 COLOR_PANEL_SELECTED_BG
@@ -6244,7 +6490,7 @@ impl Model {
         lines.push(Line::default());
         lines.push(Line::default());
 
-        let update_index = positions.update;
+        let update_index = positions.update_check;
         let update_selected = self.menu_account_index == update_index;
         let update_indicator_style = Style::default().fg(if update_selected {
             COLOR_ACCENT
@@ -6281,6 +6527,57 @@ impl Model {
             Span::styled("Re-run update check · ".to_string(), update_label_style),
             Span::styled(format!("Reddix {}", self.version_summary()), summary_style),
         ]));
+
+        if let Some(install_idx) = positions.install {
+            let install_selected = self.menu_account_index == install_idx;
+            let install_indicator_style = Style::default().fg(if install_selected {
+                COLOR_ACCENT
+            } else {
+                COLOR_TEXT_SECONDARY
+            });
+            let mut install_label_style = Style::default().fg(if install_selected {
+                COLOR_ACCENT
+            } else {
+                COLOR_TEXT_SECONDARY
+            });
+            if install_selected {
+                install_label_style = install_label_style.add_modifier(Modifier::BOLD);
+            }
+            if self.update_install_in_progress {
+                install_label_style = install_label_style.add_modifier(Modifier::ITALIC);
+            }
+            let install_text = if let Some(update) = &self.update_notice {
+                if self.update_install_in_progress {
+                    format!("Installing v{}…", update.version)
+                } else {
+                    format!("Install v{} now", update.version)
+                }
+            } else if self.update_install_in_progress {
+                "Installing update…".to_string()
+            } else {
+                "Install latest update".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if install_selected { ">" } else { " " }.to_string(),
+                    install_indicator_style,
+                ),
+                Span::raw(" "),
+                Span::styled(install_text, install_label_style),
+            ]));
+            let hint_style = Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::ITALIC);
+            let hint_text = if self.update_install_in_progress {
+                "Installer running in background…"
+            } else {
+                "Press Enter to download and run the official installer."
+            };
+            lines.push(Line::from(vec![Span::styled(
+                hint_text.to_string(),
+                hint_style,
+            )]));
+        }
 
         lines.push(Line::default());
         lines.push(Line::default());
