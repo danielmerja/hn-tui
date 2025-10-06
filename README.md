@@ -24,8 +24,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ck-zhang/reddix/release
 
 ## Quickstart
 1. Create a Reddit “script” at https://www.reddit.com/prefs/apps and set the redirect URI to `http://127.0.0.1:65010/reddix/callback`.
-2. Drop your client ID and secret into `~/.config/reddix/config.yaml` (start from [`docs/examples/config.yaml`](docs/examples/config.yaml)).
-3. Launch `reddix`, press `m`, and follow the guided menu to authorize your account.
+2. Launch `reddix`, press `m`, and follow the guided menu for setup.
+3. Prefer to configure things manually? Copy [`docs/examples/config.yaml`](docs/examples/config.yaml) into `~/.config/reddix/config.yaml` and fill in your credentials.
 
 Core shortcuts: `j/k` move, `h/l` change panes, `m` menu, `o` link menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
 
