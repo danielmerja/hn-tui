@@ -51,7 +51,6 @@ use crate::reddit;
 use crate::session;
 use crate::storage;
 use crate::update::{self, SKIP_UPDATE_ENV};
-use copypasta::{ClipboardContext, ClipboardProvider};
 
 const MAX_IMAGE_COLS: i32 = 40;
 const MAX_IMAGE_ROWS: i32 = 20;
@@ -406,7 +405,7 @@ enum MenuField {
     ClientSecret,
     UserAgent,
     Save,
-    CopyLink,
+    OpenLink,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -458,27 +457,27 @@ impl JoinState {
 }
 
 impl MenuField {
-    fn next(self, has_copy: bool) -> Self {
+    fn next(self, has_link: bool) -> Self {
         match self {
             MenuField::ClientId => MenuField::ClientSecret,
             MenuField::ClientSecret => MenuField::UserAgent,
             MenuField::UserAgent => MenuField::Save,
             MenuField::Save => {
-                if has_copy {
-                    MenuField::CopyLink
+                if has_link {
+                    MenuField::OpenLink
                 } else {
                     MenuField::ClientId
                 }
             }
-            MenuField::CopyLink => MenuField::ClientId,
+            MenuField::OpenLink => MenuField::ClientId,
         }
     }
 
-    fn previous(self, has_copy: bool) -> Self {
+    fn previous(self, has_link: bool) -> Self {
         match self {
             MenuField::ClientId => {
-                if has_copy {
-                    MenuField::CopyLink
+                if has_link {
+                    MenuField::OpenLink
                 } else {
                     MenuField::Save
                 }
@@ -486,7 +485,7 @@ impl MenuField {
             MenuField::ClientSecret => MenuField::ClientId,
             MenuField::UserAgent => MenuField::ClientSecret,
             MenuField::Save => MenuField::UserAgent,
-            MenuField::CopyLink => MenuField::Save,
+            MenuField::OpenLink => MenuField::Save,
         }
     }
 
@@ -496,7 +495,7 @@ impl MenuField {
             MenuField::ClientSecret => "Reddit Client Secret",
             MenuField::UserAgent => "User Agent",
             MenuField::Save => "Save & Close",
-            MenuField::CopyLink => "Copy Authorization Link",
+            MenuField::OpenLink => "Open Authorization Link",
         }
     }
 }
@@ -522,7 +521,7 @@ impl MenuForm {
     }
 
     fn focus(&mut self, field: MenuField) {
-        if !self.has_auth_link() && matches!(field, MenuField::CopyLink) {
+        if !self.has_auth_link() && matches!(field, MenuField::OpenLink) {
             self.active = MenuField::Save;
         } else {
             self.active = field;
@@ -537,13 +536,13 @@ impl MenuForm {
     }
 
     fn next(&mut self) {
-        let has_copy = self.has_auth_link();
-        self.active = self.active.next(has_copy);
+        let has_link = self.has_auth_link();
+        self.active = self.active.next(has_link);
     }
 
     fn previous(&mut self) {
-        let has_copy = self.has_auth_link();
-        self.active = self.active.previous(has_copy);
+        let has_link = self.has_auth_link();
+        self.active = self.active.previous(has_link);
     }
 
     fn set_values(&mut self, client_id: String, client_secret: String, user_agent: String) {
@@ -557,7 +556,7 @@ impl MenuForm {
             MenuField::ClientId => Some(&mut self.client_id),
             MenuField::ClientSecret => Some(&mut self.client_secret),
             MenuField::UserAgent => Some(&mut self.user_agent),
-            MenuField::Save | MenuField::CopyLink => None,
+            MenuField::Save | MenuField::OpenLink => None,
         }
     }
 
@@ -595,7 +594,7 @@ impl MenuForm {
             MenuField::ClientId => &self.client_id,
             MenuField::ClientSecret => &self.client_secret,
             MenuField::UserAgent => &self.user_agent,
-            MenuField::Save | MenuField::CopyLink => return String::new(),
+            MenuField::Save | MenuField::OpenLink => return String::new(),
         };
         if raw.is_empty() {
             return "(not set)".to_string();
@@ -609,13 +608,13 @@ impl MenuForm {
     fn authorization_started(&mut self, url: String) {
         self.auth_url = Some(url);
         self.auth_pending = true;
-        self.focus(MenuField::CopyLink);
+        self.focus(MenuField::OpenLink);
     }
 
     fn authorization_complete(&mut self) {
         self.auth_pending = false;
         self.auth_url = None;
-        if matches!(self.active, MenuField::CopyLink) {
+        if matches!(self.active, MenuField::OpenLink) {
             self.active = MenuField::Save;
         }
     }
@@ -2924,9 +2923,9 @@ impl Model {
                         }
                     }
                 }
-                MenuField::CopyLink => {
-                    if let Err(err) = self.copy_auth_link_to_clipboard() {
-                        let message = format!("Failed to copy authorization link: {err}");
+                MenuField::OpenLink => {
+                    if let Err(err) = self.open_auth_link_in_browser() {
+                        let message = format!("Failed to open authorization link: {err}");
                         self.menu_form.set_status(message.clone());
                         self.status_message = message;
                     }
@@ -2959,16 +2958,6 @@ impl Model {
                             self.status_message = "Guided menu closed.".to_string();
                             self.mark_dirty();
                             return Ok(false);
-                        }
-                        'c' | 'C' if self.menu_form.has_auth_link() => {
-                            if let Err(err) = self.copy_auth_link_to_clipboard() {
-                                let message = format!(
-                                    "Failed to copy authorization link: {err}"
-                                );
-                                self.menu_form.set_status(message.clone());
-                                self.status_message = message;
-                            }
-                            dirty = true;
                         }
                         _ => {}
                     }
@@ -3235,7 +3224,7 @@ impl Model {
         match webbrowser::open(&url) {
             Ok(_) => {
                 message.push_str(
-                    "Authorize Reddix in your browser, then return here once it finishes. If nothing opened automatically, copy the link shown below.",
+                    "Authorize Reddix in your browser, then return here once it finishes. If nothing opens automatically, use Open Link below.",
                 );
             }
             Err(err) => {
@@ -3258,26 +3247,16 @@ impl Model {
             let _ = tx.send(AsyncResponse::Login { result });
         });
 
-        if let Err(err) = self.copy_auth_link_to_clipboard() {
-            let warning = format!("Browser launched, but copying the link failed: {}", err);
-            self.menu_form.set_status(warning.clone());
-            self.status_message = warning;
-        }
-
         self.mark_dirty();
         Ok(())
     }
 
-    fn copy_auth_link_to_clipboard(&mut self) -> Result<()> {
+    fn open_auth_link_in_browser(&mut self) -> Result<()> {
         let Some(url) = self.menu_form.auth_link().map(|s| s.to_string()) else {
             bail!("authorization link unavailable");
         };
-        let mut clipboard =
-            ClipboardContext::new().map_err(|err| anyhow!("create clipboard context: {}", err))?;
-        clipboard
-            .set_contents(url.clone())
-            .map_err(|err| anyhow!("copy authorization link: {}", err))?;
-        let message = "Authorization link copied to clipboard.".to_string();
+        webbrowser::open(&url).map_err(|err| anyhow!("open authorization link: {}", err))?;
+        let message = "Authorization link opened in your browser.".to_string();
         self.menu_form.set_status(message.clone());
         self.status_message = message;
         self.mark_dirty();
@@ -6068,7 +6047,7 @@ impl Model {
                 spans.push(Span::styled("[ Save & Close ]".to_string(), button_style));
                 spans.push(Span::raw("  Press Enter to write credentials"));
             }
-            MenuField::CopyLink => {
+            MenuField::OpenLink => {
                 let button_style = if is_active {
                     Style::default()
                         .fg(COLOR_ACCENT)
@@ -6079,9 +6058,9 @@ impl Model {
                         .add_modifier(Modifier::BOLD)
                 };
                 let label = if self.menu_form.auth_pending {
-                    "[ Copy Link ]  Waiting for redirect… press Enter or c to copy".to_string()
+                    "[ Open Link ]  Waiting for redirect… press Enter to open".to_string()
                 } else {
-                    "[ Copy Link ]  Press Enter or c to copy URL again".to_string()
+                    "[ Open Link ]  Press Enter to open again".to_string()
                 };
                 spans.push(Span::styled(label, button_style));
             }
@@ -6417,7 +6396,7 @@ impl Model {
             MenuField::Save,
         ];
         if self.menu_form.has_auth_link() {
-            fields.push(MenuField::CopyLink);
+            fields.push(MenuField::OpenLink);
         }
         for field in fields {
             lines.push(self.menu_field_line(field));
@@ -6431,9 +6410,9 @@ impl Model {
                     .add_modifier(Modifier::BOLD),
             )]));
             let message = if self.menu_form.auth_pending {
-                "Link ready (press c to copy)".to_string()
+                "Link ready (press Enter to open)".to_string()
             } else {
-                "Press c to copy the authorization link".to_string()
+                "Press Enter to open the authorization link again".to_string()
             };
             lines.push(Line::from(vec![Span::styled(
                 message,
@@ -6447,8 +6426,8 @@ impl Model {
         }
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::raw(
-            "Controls: Tab/Shift-Tab or Up/Down to move | Backspace/Delete to edit | Enter to advance/save/copy | c to copy link | Esc back | m close".
-                to_string(),
+            "Controls: Tab/Shift-Tab or Up/Down to move | Backspace/Delete to edit | Enter to advance/save/open | Esc back | m close"
+                .to_string(),
         )]));
         if let Some(status) = &self.menu_form.status {
             lines.push(Line::default());
@@ -6471,7 +6450,7 @@ impl Model {
                         .to_string()
                 }
                 MenuScreen::Credentials => {
-                    "Guided menu: Tab/Shift-Tab change field · Enter save/advance · c copy link · Esc back · m close"
+                    "Guided menu: Tab/Shift-Tab change field · Enter save/advance/open · Esc back · m close"
                         .to_string()
                 }
             };
