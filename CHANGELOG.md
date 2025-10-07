@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.1.14] - 2025-10-07
 ### Added
 - Command palette with fuzzy subreddit/user search and consolidated actions menu access.
-- Full-resolution media saver that queues downloads without blocking the UI.
+- Full-resolution media saver (images only) that queues downloads without blocking the UI.
 ### Changed
 - Navigation keys now respect typing mode so overlays no longer hijack text input.
 

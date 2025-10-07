@@ -17,6 +17,7 @@ This document tracks community requests and ideas for future Reddix releases.
 - Support additional inline image protocols beyond kitty graphics.
 - Restore optional clipboard copy for outbound links.
 - Full-screen image view that temporarily fills the terminal for easier reading.
+- Save full-resolution videos alongside images.
 
 ## Completed Requests
 
