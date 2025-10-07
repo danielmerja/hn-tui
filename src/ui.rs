@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, Read, Stdout, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::style::Print;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, window_size, EnterAlternateScreen, LeaveAlternateScreen,
@@ -33,12 +35,14 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use reqwest::{blocking::Client, Error as ReqwestError};
+use reqwest::{blocking::Client, header::CONTENT_TYPE, Error as ReqwestError};
 use semver::Version;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use base64::{engine::general_purpose, Engine as _};
+use chrono::Utc;
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use regex::{Captures, Regex};
 use textwrap::{wrap, Options as WrapOptions};
 
@@ -161,6 +165,194 @@ impl LinkEntry {
             label: label.into(),
             url: url.into(),
         }
+    }
+}
+
+#[derive(Clone)]
+struct DownloadCandidate {
+    url: String,
+    suggested_name: String,
+}
+
+#[derive(Clone)]
+struct MediaSaveJob {
+    total: usize,
+}
+
+struct MediaSaveOutcome {
+    dest_dir: PathBuf,
+    saved_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct NavigationMatch {
+    label: String,
+    target: NavigationTarget,
+    description: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Clone)]
+enum NavigationTarget {
+    Subreddit(String),
+    User(String),
+    Search(String),
+}
+
+#[derive(Clone)]
+struct NavigationMenuState {
+    filter: String,
+    matches: Vec<NavigationMatch>,
+    editing: bool,
+    selected: usize,
+}
+
+#[derive(Clone)]
+struct ActionMenuEntry {
+    label: String,
+    action: ActionMenuAction,
+    enabled: bool,
+}
+
+#[derive(Clone)]
+enum ActionMenuMode {
+    Root,
+    Links,
+    Navigation(NavigationMenuState),
+}
+
+#[derive(Clone)]
+enum ActionMenuAction {
+    OpenLinks,
+    SaveMedia,
+    OpenNavigation,
+}
+
+impl NavigationMatch {
+    fn new(label: impl Into<String>, target: NavigationTarget) -> Self {
+        Self {
+            label: label.into(),
+            target,
+            description: None,
+            enabled: true,
+        }
+    }
+
+    fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+impl NavigationMenuState {
+    fn new(filter: String, matches: Vec<NavigationMatch>, editing: bool) -> Self {
+        let mut state = Self {
+            filter,
+            matches,
+            editing,
+            selected: 0,
+        };
+        state.ensure_selection();
+        state
+    }
+
+    fn ensure_selection(&mut self) {
+        if self.matches.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        if self.selected >= self.matches.len() || !self.matches[self.selected].enabled {
+            if let Some(idx) = self.matches.iter().position(|m| m.enabled) {
+                self.selected = idx;
+            } else {
+                self.selected = 0;
+            }
+        }
+    }
+
+    fn active_match(&self) -> Option<&NavigationMatch> {
+        self.matches.get(self.selected)
+    }
+
+    fn select_next_enabled(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let mut idx = self.selected;
+        for _ in 0..self.matches.len() {
+            idx = (idx + 1) % self.matches.len();
+            if self.matches[idx].enabled {
+                self.selected = idx;
+                return;
+            }
+        }
+    }
+
+    fn select_previous_enabled(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let mut idx = self.selected;
+        for _ in 0..self.matches.len() {
+            idx = idx.checked_sub(1).unwrap_or(self.matches.len() - 1);
+            if self.matches[idx].enabled {
+                self.selected = idx;
+                return;
+            }
+        }
+    }
+
+    fn page_next_enabled(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let mut idx = self.selected;
+        let len = self.matches.len();
+        for _ in 0..len {
+            idx = (idx + 5).min(len.saturating_sub(1));
+            if self.matches[idx].enabled {
+                self.selected = idx;
+                return;
+            }
+            if idx + 1 >= len {
+                break;
+            }
+        }
+    }
+
+    fn page_previous_enabled(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let mut idx = self.selected;
+        for _ in 0..self.matches.len() {
+            if idx == 0 {
+                break;
+            }
+            idx = idx.saturating_sub(5);
+            if self.matches[idx].enabled {
+                self.selected = idx;
+                return;
+            }
+            if idx == 0 {
+                break;
+            }
+        }
+    }
+}
+
+impl ActionMenuEntry {
+    fn new(label: impl Into<String>, action: ActionMenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            enabled: true,
+        }
+    }
+
+    fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
     }
 }
 
@@ -734,6 +926,9 @@ enum AsyncResponse {
         post_name: String,
         result: Result<Option<MediaPreview>>,
     },
+    MediaSave {
+        result: Result<MediaSaveOutcome>,
+    },
     Login {
         result: Result<String>,
     },
@@ -852,6 +1047,145 @@ fn normalize_subreddit_name(raw: &str) -> String {
         "r/frontpage".to_string()
     } else {
         format!("r/{}", rest)
+    }
+}
+
+fn normalize_user_target(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_slashes = trimmed.trim_start_matches('/');
+    let (core, matched) = if let Some(rest) = without_slashes.strip_prefix("u/") {
+        (rest, true)
+    } else if let Some(rest) = without_slashes.strip_prefix("U/") {
+        (rest, true)
+    } else if let Some(rest) = without_slashes.strip_prefix("user/") {
+        (rest, true)
+    } else if let Some(rest) = without_slashes.strip_prefix("USER/") {
+        (rest, true)
+    } else if let Some(rest) = without_slashes.strip_prefix("User/") {
+        (rest, true)
+    } else if let Some(rest) = without_slashes.strip_prefix('@') {
+        (rest, true)
+    } else {
+        (without_slashes, false)
+    };
+    if !matched {
+        return None;
+    }
+    let normalized = core.trim_start_matches('/').trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("u/{}", normalized))
+    }
+}
+
+fn canonical_search_target(raw: &str) -> Option<String> {
+    let query = raw.trim();
+    if query.is_empty() {
+        None
+    } else {
+        Some(format!("search: {}", query))
+    }
+}
+
+fn pop_last_word(text: &mut String) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let original_len = text.len();
+    while text.ends_with(char::is_whitespace) {
+        text.pop();
+    }
+    while let Some(ch) = text.chars().last() {
+        if ch.is_whitespace() {
+            break;
+        }
+        text.pop();
+    }
+    while text.ends_with(char::is_whitespace) {
+        text.pop();
+    }
+    original_len != text.len()
+}
+
+fn navigation_display_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("search:") {
+        let query = rest.trim();
+        if query.is_empty() {
+            "Search results".to_string()
+        } else {
+            format!("Search · {}", query)
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn navigation_target_key(target: &NavigationTarget) -> String {
+    match target {
+        NavigationTarget::Subreddit(name) => format!("sub:{}", name.to_ascii_lowercase()),
+        NavigationTarget::User(name) => format!("user:{}", name.to_ascii_lowercase()),
+        NavigationTarget::Search(query) => format!("search:{}", query.to_ascii_lowercase()),
+    }
+}
+
+fn push_navigation_entry(
+    buffer: &mut Vec<NavigationMatch>,
+    seen: &mut HashSet<String>,
+    entry: NavigationMatch,
+) {
+    let key = navigation_target_key(&entry.target);
+    if seen.insert(key) {
+        buffer.push(entry);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FeedKind<'a> {
+    FrontPage,
+    Subreddit(&'a str),
+    User(&'a str),
+    Search(&'a str),
+}
+
+fn classify_feed_target(target: &str) -> FeedKind<'_> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || is_front_page(trimmed) {
+        return FeedKind::FrontPage;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("search:") {
+        let query = rest.trim();
+        if query.is_empty() {
+            FeedKind::FrontPage
+        } else {
+            FeedKind::Search(query)
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("u/") {
+        let user = rest.trim();
+        if user.is_empty() {
+            FeedKind::FrontPage
+        } else {
+            FeedKind::User(user)
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("U/") {
+        let user = rest.trim();
+        if user.is_empty() {
+            FeedKind::FrontPage
+        } else {
+            FeedKind::User(user)
+        }
+    } else {
+        let subreddit = trimmed.trim_start_matches("r/").trim_start_matches('/');
+        if subreddit.is_empty() {
+            FeedKind::FrontPage
+        } else {
+            FeedKind::Subreddit(subreddit)
+        }
     }
 }
 
@@ -1613,6 +1947,264 @@ fn image_label(url: &str) -> String {
         .unwrap_or_else(|| "media".to_string())
 }
 
+fn collect_high_res_media(post: &reddit::Post) -> Vec<DownloadCandidate> {
+    let mut candidates = Vec::new();
+
+    if let Some(gallery) = &post.gallery_data {
+        if let Some(metadata) = &post.media_metadata {
+            for item in &gallery.items {
+                if let Some(entry) = metadata.get(&item.media_id) {
+                    if entry.status.eq_ignore_ascii_case("failed") {
+                        continue;
+                    }
+                    if let Some(url) = preferred_media_metadata_url(entry) {
+                        candidates.push(DownloadCandidate {
+                            url: url.clone(),
+                            suggested_name: image_label(&url),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if let Some(metadata) = &post.media_metadata {
+            for entry in metadata.values() {
+                if entry.status.eq_ignore_ascii_case("failed") {
+                    continue;
+                }
+                if let Some(url) = preferred_media_metadata_url(entry) {
+                    candidates.push(DownloadCandidate {
+                        url: url.clone(),
+                        suggested_name: image_label(&url),
+                    });
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if let Some(url) = select_full_image_source(post) {
+            candidates.push(DownloadCandidate {
+                url: url.clone(),
+                suggested_name: image_label(&url),
+            });
+        }
+    }
+
+    candidates
+}
+
+fn preferred_media_metadata_url(entry: &reddit::MediaMetadata) -> Option<String> {
+    let primary = sanitize_preview_url(&entry.full.url);
+    if !primary.is_empty() {
+        return Some(primary);
+    }
+
+    for variant in &entry.preview {
+        let candidate = sanitize_preview_url(&variant.url);
+        if !candidate.is_empty() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(gif) = &entry.full.gif {
+        let candidate = sanitize_preview_url(gif);
+        if !candidate.is_empty() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(mp4) = &entry.full.mp4 {
+        let candidate = sanitize_preview_url(mp4);
+        if !candidate.is_empty() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn select_full_image_source(post: &reddit::Post) -> Option<String> {
+    for image in &post.preview.images {
+        let url = sanitize_preview_url(&image.source.url);
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+
+    let direct = sanitize_preview_url(post.url.trim());
+    if !direct.is_empty() && is_supported_preview_url(&direct) {
+        return Some(direct);
+    }
+
+    None
+}
+
+fn safe_file_name(label: &str) -> String {
+    let mut sanitized = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else if ch.is_whitespace() {
+            if !sanitized.ends_with('_') {
+                sanitized.push('_');
+            }
+        } else if !sanitized.ends_with('_') {
+            sanitized.push('_');
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('_').trim_start_matches('.');
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extension_from_content_type(content_type: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .map(|value| value.trim().to_ascii_lowercase())?;
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/tiff" => Some("tiff"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        _ => None,
+    }
+}
+
+fn image_format_extension(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Png => Some("png"),
+        ImageFormat::Jpeg => Some("jpg"),
+        ImageFormat::Gif => Some("gif"),
+        ImageFormat::WebP => Some("webp"),
+        ImageFormat::Bmp => Some("bmp"),
+        ImageFormat::Tiff => Some("tiff"),
+        _ => None,
+    }
+}
+
+fn default_download_dir() -> PathBuf {
+    if let Some(dir) = dirs::download_dir() {
+        return dir;
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join("Downloads");
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn ensure_unique_path(dir: &Path, file_name: &str) -> PathBuf {
+    let mut candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image");
+    let ext = path.extension().and_then(|value| value.to_str());
+
+    for index in 2..10_000 {
+        let candidate_name = match ext {
+            Some(ext) => format!("{stem}-{index}.{ext}"),
+            None => format!("{stem}-{index}"),
+        };
+        candidate = dir.join(&candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    dir.join(format!("{stem}-{}.tmp", Utc::now().timestamp()))
+}
+
+fn download_high_res_media(url: &str, suggested_name: &str, dest_dir: &Path) -> Result<PathBuf> {
+    let mut response = HTTP_CLIENT
+        .get(url)
+        .send()
+        .with_context(|| format!("request full image {}", url))?;
+
+    if !response.status().is_success() {
+        bail!("download failed with status {}", response.status());
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
+    let mut bytes = Vec::with_capacity(256 * 1024);
+    response
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read full image {}", url))?;
+
+    if bytes.is_empty() {
+        bail!("download returned no data");
+    }
+
+    let mut file_name = safe_file_name(suggested_name);
+    if Path::new(&file_name).extension().is_none() {
+        if let Some(ext) = content_type
+            .as_deref()
+            .and_then(extension_from_content_type)
+        {
+            file_name = format!("{file_name}.{ext}");
+        }
+    }
+
+    if Path::new(&file_name).extension().is_none() {
+        if let Ok(format) = image::guess_format(&bytes) {
+            if let Some(ext) = image_format_extension(format) {
+                file_name = format!("{file_name}.{ext}");
+            }
+        }
+    }
+
+    if Path::new(&file_name).extension().is_none() {
+        file_name.push_str(".img");
+    }
+
+    let path = ensure_unique_path(dest_dir, &file_name);
+    fs::write(&path, &bytes).with_context(|| format!("write image {}", path.display()))?;
+    Ok(path)
+}
+
+fn save_media_batch(
+    candidates: Vec<DownloadCandidate>,
+    dest_dir: PathBuf,
+) -> Result<MediaSaveOutcome> {
+    if !dest_dir.exists() {
+        fs::create_dir_all(&dest_dir)
+            .with_context(|| format!("prepare download directory {}", dest_dir.display()))?;
+    }
+
+    let mut saved_paths = Vec::new();
+    for candidate in candidates {
+        let path = download_high_res_media(&candidate.url, &candidate.suggested_name, &dest_dir)?;
+        saved_paths.push(path);
+    }
+
+    Ok(MediaSaveOutcome {
+        dest_dir,
+        saved_paths,
+    })
+}
+
 fn env_truthy(key: &str) -> bool {
     env::var(key)
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
@@ -1751,6 +2343,7 @@ pub struct Model {
     media_previews: HashMap<String, MediaPreview>,
     media_failures: HashSet<String>,
     pending_media: HashMap<String, Arc<AtomicBool>>,
+    media_save_in_progress: Option<MediaSaveJob>,
     media_layouts: HashMap<String, MediaLayout>,
     media_handle: Option<media::Handle>,
     feed_cache: HashMap<FeedCacheKey, FeedCacheEntry>,
@@ -1791,9 +2384,11 @@ pub struct Model {
     menu_form: MenuForm,
     menu_accounts: Vec<MenuAccountEntry>,
     menu_account_index: usize,
-    link_menu_visible: bool,
-    link_menu_items: Vec<LinkEntry>,
-    link_menu_selected: usize,
+    action_menu_visible: bool,
+    action_menu_mode: ActionMenuMode,
+    action_menu_items: Vec<ActionMenuEntry>,
+    action_menu_selected: usize,
+    action_link_items: Vec<LinkEntry>,
     join_states: HashMap<i64, JoinState>,
     update_notice: Option<update::UpdateInfo>,
     update_check_in_progress: bool,
@@ -1893,7 +2488,7 @@ impl Model {
                 if !self.update_banner_selected {
                     self.update_banner_selected = true;
                     self.post_offset.set(0);
-                    self.dismiss_link_menu(None);
+                    self.close_action_menu(None);
                     if let Some(update) = &self.update_notice {
                         if self.update_install_finished {
                             self.status_message = format!(
@@ -2193,7 +2788,7 @@ impl Model {
         self.selected_post = 0;
 
         self.reset_navigation_defaults();
-        self.dismiss_link_menu(None);
+        self.close_action_menu(None);
 
         self.needs_redraw = true;
     }
@@ -2409,6 +3004,7 @@ impl Model {
             media_previews: HashMap::new(),
             media_failures: HashSet::new(),
             pending_media: HashMap::new(),
+            media_save_in_progress: None,
             media_layouts: HashMap::new(),
             media_handle: opts.media_handle.clone(),
             feed_cache: HashMap::new(),
@@ -2449,9 +3045,11 @@ impl Model {
             menu_form: MenuForm::default(),
             menu_accounts: Vec::new(),
             menu_account_index: 0,
-            link_menu_visible: false,
-            link_menu_items: Vec::new(),
-            link_menu_selected: 0,
+            action_menu_visible: false,
+            action_menu_mode: ActionMenuMode::Root,
+            action_menu_items: Vec::new(),
+            action_menu_selected: 0,
+            action_link_items: Vec::new(),
             join_states: HashMap::new(),
             update_notice: None,
             update_check_in_progress: false,
@@ -2572,7 +3170,7 @@ impl Model {
             if event::poll(timeout)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        match self.handle_key(key.code) {
+                        match self.handle_key(key) {
                             Ok(true) => break,
                             Ok(false) => {}
                             Err(err) => {
@@ -2658,13 +3256,15 @@ impl Model {
         Ok(())
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let code = key.code;
+
         if self.menu_visible {
             return self.handle_menu_key(code);
         }
 
-        if self.link_menu_visible {
-            return self.handle_link_menu_key(code);
+        if self.action_menu_visible {
+            return self.handle_action_menu_key(key);
         }
 
         let mut dirty = false;
@@ -2679,6 +3279,10 @@ impl Model {
                 self.open_menu()?;
                 dirty = true;
             }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.open_navigation_mode(String::new(), true);
+                return Ok(false);
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.reload_posts()?;
                 dirty = true;
@@ -2688,12 +3292,8 @@ impl Model {
                 dirty = true;
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
-                if self.banner_selected() {
-                    self.status_message = "Select a post first to open its links.".to_string();
-                    dirty = true;
-                } else {
-                    self.open_link_menu();
-                }
+                self.open_action_menu();
+                return Ok(false);
             }
             KeyCode::Char('u') => {
                 if self.banner_selected() {
@@ -2741,6 +3341,9 @@ impl Model {
                 }
                 dirty = true;
             }
+            KeyCode::Char('S') => {
+                self.save_high_res_media()?;
+            }
             KeyCode::Char('c') => {
                 if self.focused_pane == Pane::Comments {
                     self.toggle_selected_comment_fold();
@@ -2772,7 +3375,7 @@ impl Model {
                     if previous != self.focused_pane {
                         self.focused_pane = previous;
                         if self.focused_pane == Pane::Navigation {
-                            self.dismiss_link_menu(None);
+                            self.close_action_menu(None);
                         }
                         self.status_message = Self::focus_status_for(self.focused_pane);
                         dirty = true;
@@ -2789,7 +3392,7 @@ impl Model {
                     if next != self.focused_pane {
                         self.focused_pane = next;
                         if self.focused_pane == Pane::Navigation {
-                            self.dismiss_link_menu(None);
+                            self.close_action_menu(None);
                         }
                         self.status_message = Self::focus_status_for(self.focused_pane);
                         dirty = true;
@@ -2918,7 +3521,7 @@ impl Model {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Result<()> {
-        if self.menu_visible || self.link_menu_visible {
+        if self.menu_visible || self.action_menu_visible {
             return Ok(());
         }
 
@@ -3165,26 +3768,120 @@ impl Model {
         collected
     }
 
-    fn open_link_menu(&mut self) {
-        let items = self.collect_links_for_current_context();
-        if items.is_empty() {
-            self.status_message = "No links available in the current context.".to_string();
+    fn save_high_res_media(&mut self) -> Result<()> {
+        if self.banner_selected() {
+            self.status_message = "Select a post before saving media.".to_string();
             self.mark_dirty();
-            return;
+            return Ok(());
         }
+
+        if self.media_save_in_progress.is_some() {
+            self.status_message = "Media download already in progress.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let Some(post) = self.posts.get(self.selected_post) else {
+            self.status_message =
+                "No post selected. Select a post with media and try again.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        let candidates = collect_high_res_media(&post.post);
+        if candidates.is_empty() {
+            self.status_message = "No downloadable media found for the selected post.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let dest_dir = default_download_dir();
+        let total = candidates.len();
+
+        self.media_save_in_progress = Some(MediaSaveJob { total });
+        self.status_message = if total == 1 {
+            "Saving media…".to_string()
+        } else {
+            format!("Saving {} files…", total)
+        };
+        self.spinner.reset();
+        self.mark_dirty();
+
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let result = save_media_batch(candidates, dest_dir);
+            let _ = tx.send(AsyncResponse::MediaSave { result });
+        });
+
+        Ok(())
+    }
+
+    fn build_action_menu_entries(&self) -> Vec<ActionMenuEntry> {
+        let links = self.collect_links_for_current_context();
+        let mut entries = Vec::new();
+
+        let links_label = if links.is_empty() {
+            "Open links… (none available)".to_string()
+        } else {
+            format!("Open links… ({} available)", links.len())
+        };
+        let mut links_entry = ActionMenuEntry::new(links_label, ActionMenuAction::OpenLinks);
+        if links.is_empty() {
+            links_entry = links_entry.disabled();
+        }
+        entries.push(links_entry);
+
+        let media_available = if self.banner_selected() {
+            false
+        } else {
+            self.posts
+                .get(self.selected_post)
+                .map(|preview| !collect_high_res_media(&preview.post).is_empty())
+                .unwrap_or(false)
+        };
+        let mut media_label = "Save full-resolution media".to_string();
+        if let Some(job) = &self.media_save_in_progress {
+            media_label = format!("Saving media… ({} files)", job.total);
+        }
+        let mut media_entry = ActionMenuEntry::new(media_label, ActionMenuAction::SaveMedia);
+        if !media_available || self.media_save_in_progress.is_some() {
+            media_entry = media_entry.disabled();
+        }
+        entries.push(media_entry);
+
+        entries.push(ActionMenuEntry::new(
+            "Search subreddits & users…",
+            ActionMenuAction::OpenNavigation,
+        ));
+
+        entries
+    }
+
+    fn open_action_menu(&mut self) {
         self.queue_active_kitty_delete();
-        self.link_menu_items = items;
-        self.link_menu_selected = 0;
-        self.link_menu_visible = true;
-        self.status_message = "Link menu: j/k move · Enter open · Esc closes".to_string();
+        self.action_menu_items = self.build_action_menu_entries();
+        self.action_menu_selected = self
+            .action_menu_items
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.enabled)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        self.action_link_items.clear();
+        self.action_menu_mode = ActionMenuMode::Root;
+        self.action_menu_visible = true;
+        self.status_message =
+            "Actions: j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Esc/o back".to_string();
         self.mark_dirty();
     }
 
-    fn dismiss_link_menu(&mut self, message: Option<&str>) {
-        if self.link_menu_visible {
-            self.link_menu_visible = false;
-            self.link_menu_items.clear();
-            self.link_menu_selected = 0;
+    fn close_action_menu(&mut self, message: Option<&str>) {
+        if self.action_menu_visible {
+            self.action_menu_visible = false;
+            self.action_menu_mode = ActionMenuMode::Root;
+            self.action_menu_items.clear();
+            self.action_menu_selected = 0;
+            self.action_link_items.clear();
             if let Some(msg) = message {
                 self.status_message = msg.to_string();
             }
@@ -3192,49 +3889,286 @@ impl Model {
         }
     }
 
-    fn handle_link_menu_key(&mut self, code: KeyCode) -> Result<bool> {
-        if self.link_menu_items.is_empty() {
-            if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-                self.dismiss_link_menu(Some("Link menu closed."));
+    fn open_navigation_mode(&mut self, filter: String, editing: bool) {
+        self.queue_active_kitty_delete();
+        let state = self.build_navigation_state(filter, editing);
+        self.action_menu_items.clear();
+        self.action_menu_selected = 0;
+        self.action_link_items.clear();
+        self.action_menu_mode = ActionMenuMode::Navigation(state);
+        self.action_menu_visible = true;
+        self.status_message =
+            "Navigation: type to search · ↑/↓ choose · Enter/l open · Tab toggle typing · Esc clear/close · h back · Ctrl+H/J/K/L navigate (even when typing)".to_string();
+        self.mark_dirty();
+    }
+
+    fn build_navigation_state(&self, filter: String, editing: bool) -> NavigationMenuState {
+        let matches = self.navigation_matches(&filter);
+        NavigationMenuState::new(filter, matches, editing)
+    }
+
+    fn navigation_matches(&self, filter: &str) -> Vec<NavigationMatch> {
+        let trimmed = filter.trim();
+        let mut matches = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stored: Vec<(String, NavigationTarget, Option<String>)> = Vec::new();
+
+        for name in &self.subreddits {
+            let kind = classify_feed_target(name);
+            let label = navigation_display_name(name);
+            let (target, description) = match kind {
+                FeedKind::FrontPage => (
+                    NavigationTarget::Subreddit(name.clone()),
+                    Some("front page".to_string()),
+                ),
+                FeedKind::Subreddit(_) => (
+                    NavigationTarget::Subreddit(name.clone()),
+                    Some("subscribed".to_string()),
+                ),
+                FeedKind::User(user) => (
+                    NavigationTarget::User(user.to_string()),
+                    Some("user profile".to_string()),
+                ),
+                FeedKind::Search(query) => (
+                    NavigationTarget::Search(query.to_string()),
+                    Some("recent search".to_string()),
+                ),
+            };
+            stored.push((label, target, description));
+        }
+
+        if trimmed.is_empty() {
+            for (label, target, description) in &stored {
+                let mut entry = NavigationMatch::new(label.clone(), target.clone());
+                if let Some(desc) = description {
+                    entry = entry.with_description(desc.clone());
+                }
+                push_navigation_entry(&mut matches, &mut seen, entry);
+            }
+            return matches;
+        }
+
+        let trimmed_lower = trimmed.to_ascii_lowercase();
+
+        let normalized = normalize_subreddit_name(trimmed);
+        let direct = NavigationMatch::new(
+            format!("Open {}", normalized),
+            NavigationTarget::Subreddit(normalized.clone()),
+        )
+        .with_description("typed subreddit");
+        push_navigation_entry(&mut matches, &mut seen, direct);
+
+        if let Some(user_target) = normalize_user_target(trimmed) {
+            let entry = NavigationMatch::new(
+                format!("Open {}", user_target),
+                NavigationTarget::User(user_target.trim_start_matches("u/").to_string()),
+            )
+            .with_description("user profile");
+            push_navigation_entry(&mut matches, &mut seen, entry);
+        }
+
+        if let Some(search_target) = canonical_search_target(trimmed) {
+            let term = search_target
+                .trim_start_matches("search:")
+                .trim()
+                .to_string();
+            let entry = NavigationMatch::new(
+                format!("Search Reddit for \"{}\"", term),
+                NavigationTarget::Search(term.clone()),
+            )
+            .with_description("search");
+            push_navigation_entry(&mut matches, &mut seen, entry);
+        }
+
+        let matcher = SkimMatcherV2::default();
+        let mut scored: Vec<(i64, usize)> = Vec::new();
+        for (index, (label, _, _)) in stored.iter().enumerate() {
+            let label_lower = label.to_ascii_lowercase();
+            if let Some(score) = matcher.fuzzy_match(&label_lower, &trimmed_lower) {
+                scored.push((score, index));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (_, idx) in scored {
+            let (label, target, description) = &stored[idx];
+            let mut entry = NavigationMatch::new(label.clone(), target.clone());
+            if let Some(desc) = description {
+                entry = entry.with_description(desc.clone());
+            }
+            push_navigation_entry(&mut matches, &mut seen, entry);
+        }
+
+        matches
+    }
+    fn refresh_navigation_matches(&self, state: &mut NavigationMenuState) {
+        state.matches = self.navigation_matches(&state.filter);
+        state.ensure_selection();
+    }
+
+    fn activate_navigation_target(&mut self, target: &NavigationTarget) -> Result<()> {
+        match target {
+            NavigationTarget::Subreddit(name) => {
+                let normalized = normalize_subreddit_name(name);
+                if !self
+                    .subreddits
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&normalized))
+                {
+                    self.subreddits.push(normalized.clone());
+                    self.subreddits
+                        .sort_by_key(|name| name.to_ascii_lowercase());
+                }
+                self.select_subreddit_by_name(&normalized);
+                let label = navigation_display_name(&normalized);
+                self.status_message = format!("Loading {} ({})…", label, sort_label(self.sort));
+                self.reload_posts()?;
+                self.focused_pane = Pane::Posts;
+                self.close_action_menu(None);
+                self.mark_dirty();
+            }
+            NavigationTarget::User(username) => {
+                let trimmed = username.trim();
+                if trimmed.is_empty() {
+                    self.status_message = "Provide a username to open.".to_string();
+                    self.mark_dirty();
+                    return Ok(());
+                }
+                let canonical = format!("u/{}", trimmed);
+                if !self
+                    .subreddits
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&canonical))
+                {
+                    self.subreddits.push(canonical.clone());
+                    self.subreddits
+                        .sort_by_key(|name| name.to_ascii_lowercase());
+                }
+                self.select_subreddit_by_name(&canonical);
+                let label = navigation_display_name(&canonical);
+                self.status_message = format!("Loading {} ({})…", label, sort_label(self.sort));
+                self.reload_posts()?;
+                self.focused_pane = Pane::Posts;
+                self.close_action_menu(None);
+                self.mark_dirty();
+            }
+            NavigationTarget::Search(query) => {
+                let trimmed = query.trim();
+                if trimmed.is_empty() {
+                    self.status_message = "Enter a search term to continue.".to_string();
+                    self.mark_dirty();
+                    return Ok(());
+                }
+                let canonical = format!("search: {}", trimmed);
+                if !self
+                    .subreddits
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&canonical))
+                {
+                    self.subreddits.push(canonical.clone());
+                    self.subreddits
+                        .sort_by_key(|name| name.to_ascii_lowercase());
+                }
+                self.select_subreddit_by_name(&canonical);
+                self.status_message = format!(
+                    "Searching Reddit for \"{}\" ({})…",
+                    trimmed,
+                    sort_label(self.sort)
+                );
+                self.reload_posts()?;
+                self.focused_pane = Pane::Posts;
+                self.close_action_menu(None);
+                self.mark_dirty();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_action_links_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let code = key.code;
+
+        if self.action_link_items.is_empty() {
+            if matches!(
+                code,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Char('H')
+            ) {
+                self.action_menu_mode = ActionMenuMode::Root;
+                self.action_menu_selected = 0;
+                self.status_message =
+                    "Actions: j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Esc/o back"
+                        .to_string();
+                self.mark_dirty();
             }
             return Ok(false);
         }
 
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.dismiss_link_menu(Some("Link menu closed."));
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Char('H') => {
+                self.action_menu_mode = ActionMenuMode::Root;
+                self.action_menu_selected = 0;
+                self.status_message =
+                    "Actions: j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Esc/o back"
+                        .to_string();
+                self.mark_dirty();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.link_menu_selected > 0 {
-                    self.link_menu_selected -= 1;
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.action_menu_selected > 0 {
+                    self.action_menu_selected -= 1;
                     self.mark_dirty();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.link_menu_selected + 1 < self.link_menu_items.len() {
-                    self.link_menu_selected += 1;
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.action_menu_selected + 1 < self.action_link_items.len() {
+                    self.action_menu_selected += 1;
+                    self.mark_dirty();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                if self.action_menu_selected > 0 {
+                    self.action_menu_selected -= 1;
+                    self.mark_dirty();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                if self.action_menu_selected + 1 < self.action_link_items.len() {
+                    self.action_menu_selected += 1;
                     self.mark_dirty();
                 }
             }
             KeyCode::PageUp => {
-                if self.link_menu_selected > 0 {
-                    let step = self.link_menu_selected.min(5);
-                    self.link_menu_selected -= step;
+                if self.action_menu_selected > 0 {
+                    let step = self.action_menu_selected.min(5);
+                    self.action_menu_selected -= step;
                     self.mark_dirty();
                 }
             }
             KeyCode::PageDown => {
-                if self.link_menu_selected + 1 < self.link_menu_items.len() {
-                    let remaining = self.link_menu_items.len() - self.link_menu_selected - 1;
+                if self.action_menu_selected + 1 < self.action_link_items.len() {
+                    let remaining = self.action_link_items.len() - self.action_menu_selected - 1;
                     let step = remaining.min(5);
-                    self.link_menu_selected += step;
+                    self.action_menu_selected += step;
                     self.mark_dirty();
                 }
             }
-            KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => {
-                if let Err(err) = self.open_selected_link() {
-                    self.status_message = format!("Failed to open link: {err}");
-                    self.mark_dirty();
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('L') => {
+                let index = self
+                    .action_menu_selected
+                    .min(self.action_link_items.len().saturating_sub(1));
+                let entry = &self.action_link_items[index];
+                let label = entry.label.clone();
+                let url = entry.url.clone();
+                match webbrowser::open(&url) {
+                    Ok(_) => {
+                        let message = format!("Opened {label} in your browser.");
+                        self.close_action_menu(Some(&message));
+                        self.status_message = message;
+                        self.mark_dirty();
+                    }
+                    Err(err) => {
+                        self.status_message = format!("Failed to open {label}: {err} (URL: {url})");
+                        self.mark_dirty();
+                    }
                 }
             }
             _ => {}
@@ -3243,33 +4177,613 @@ impl Model {
         Ok(false)
     }
 
-    fn open_selected_link(&mut self) -> Result<()> {
-        if self.link_menu_items.is_empty() {
-            self.status_message = "No link selected.".to_string();
-            return Ok(());
+    fn handle_action_menu_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let code = key.code;
+        let modifiers = key.modifiers;
+
+        match self.action_menu_mode.clone() {
+            ActionMenuMode::Root => {
+                if self.action_menu_items.is_empty() {
+                    if matches!(
+                        code,
+                        KeyCode::Esc
+                            | KeyCode::Char('o')
+                            | KeyCode::Char('O')
+                            | KeyCode::Char('q')
+                            | KeyCode::Char('h')
+                            | KeyCode::Char('H')
+                    ) {
+                        self.close_action_menu(Some("Actions closed."));
+                    }
+                    return Ok(false);
+                }
+
+                match code {
+                    KeyCode::Esc
+                    | KeyCode::Char('o')
+                    | KeyCode::Char('O')
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('H') => {
+                        self.close_action_menu(Some("Actions closed."));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                        if self.action_menu_selected > 0 {
+                            self.action_menu_selected -= 1;
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                        if self.action_menu_selected + 1 < self.action_menu_items.len() {
+                            self.action_menu_selected += 1;
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if self.action_menu_selected > 0 {
+                            let step = self.action_menu_selected.min(5);
+                            self.action_menu_selected -= step;
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if self.action_menu_selected + 1 < self.action_menu_items.len() {
+                            let remaining =
+                                self.action_menu_items.len() - self.action_menu_selected - 1;
+                            let step = remaining.min(5);
+                            self.action_menu_selected += step;
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('L') => {
+                        let index = self
+                            .action_menu_selected
+                            .min(self.action_menu_items.len().saturating_sub(1));
+                        let entry = self.action_menu_items[index].clone();
+                        if !entry.enabled {
+                            self.status_message =
+                                "That action isn’t available right now.".to_string();
+                            self.mark_dirty();
+                            return Ok(false);
+                        }
+                        match entry.action {
+                            ActionMenuAction::OpenLinks => {
+                                let items = self.collect_links_for_current_context();
+                                if items.is_empty() {
+                                    self.status_message =
+                                        "No links available in the current context.".to_string();
+                                    self.mark_dirty();
+                                } else {
+                                    self.action_link_items = items;
+                                    self.action_menu_mode = ActionMenuMode::Links;
+                                    self.action_menu_selected = 0;
+                                    self.status_message =
+                                        "Links: j/k move · Enter/l open · h/Esc back".to_string();
+                                    self.mark_dirty();
+                                }
+                            }
+                            ActionMenuAction::SaveMedia => {
+                                self.save_high_res_media()?;
+                                self.action_menu_items = self.build_action_menu_entries();
+                                if self.action_menu_selected >= self.action_menu_items.len() {
+                                    self.action_menu_selected =
+                                        self.action_menu_items.len().saturating_sub(1);
+                                }
+                            }
+                            ActionMenuAction::OpenNavigation => {
+                                self.open_navigation_mode(String::new(), true);
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ActionMenuMode::Links => {
+                return self.handle_action_links_key(key);
+            }
+            ActionMenuMode::Navigation(mut state) => {
+                if state.matches.is_empty() {
+                    state.selected = 0;
+                }
+
+                match code {
+                    KeyCode::Esc => {
+                        if state.editing && !state.filter.is_empty() {
+                            state.filter.clear();
+                            self.refresh_navigation_matches(&mut state);
+                            self.status_message =
+                                "Command palette cleared. Type to search or Esc to close."
+                                    .to_string();
+                            self.mark_dirty();
+                        } else {
+                            self.close_action_menu(Some("Actions closed."));
+                            return Ok(false);
+                        }
+                    }
+                    KeyCode::Tab => {
+                        state.editing = !state.editing;
+                        if state.editing {
+                            self.status_message =
+                                "Command palette: typing enabled · Esc clear · Ctrl+H/J/K/L navigate"
+                                    .to_string();
+                        } else {
+                            self.status_message =
+                                "Command palette: browse with ↑/↓ · Enter/l open · h back · Ctrl+H/J/K/L navigate · Tab to type"
+                                    .to_string();
+                        }
+                        self.mark_dirty();
+                    }
+                    KeyCode::Backspace => {
+                        if state.editing && state.filter.pop().is_some() {
+                            self.refresh_navigation_matches(&mut state);
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if state.editing && !state.filter.is_empty() {
+                            state.filter.clear();
+                            self.refresh_navigation_matches(&mut state);
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if state.editing && !state.filter.is_empty() {
+                            state.filter.clear();
+                            self.refresh_navigation_matches(&mut state);
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if state.editing && pop_last_word(&mut state.filter) {
+                            self.refresh_navigation_matches(&mut state);
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = state.active_match().cloned() {
+                            if !entry.enabled {
+                                self.status_message =
+                                    "That entry is unavailable right now.".to_string();
+                                self.mark_dirty();
+                            } else {
+                                let filter_snapshot = state.filter.clone();
+                                let editing_snapshot = state.editing;
+                                self.activate_navigation_target(&entry.target)?;
+                                if !self.action_menu_visible {
+                                    return Ok(false);
+                                }
+                                state =
+                                    self.build_navigation_state(filter_snapshot, editing_snapshot);
+                            }
+                        } else {
+                            self.status_message = "No results to open.".to_string();
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        if modifiers.contains(KeyModifiers::CONTROL) || !state.editing {
+                            if let Some(entry) = state.active_match().cloned() {
+                                if !entry.enabled {
+                                    self.status_message =
+                                        "That entry is unavailable right now.".to_string();
+                                    self.mark_dirty();
+                                } else {
+                                    let filter_snapshot = state.filter.clone();
+                                    let editing_snapshot = state.editing;
+                                    self.activate_navigation_target(&entry.target)?;
+                                    if !self.action_menu_visible {
+                                        return Ok(false);
+                                    }
+                                    state = self
+                                        .build_navigation_state(filter_snapshot, editing_snapshot);
+                                }
+                            } else {
+                                self.status_message = "No results to open.".to_string();
+                                self.mark_dirty();
+                            }
+                        } else {
+                            let ch = match code {
+                                KeyCode::Char('l') => 'l',
+                                KeyCode::Char('L') => 'L',
+                                _ => unreachable!(),
+                            };
+                            state.filter.push(ch);
+                            self.refresh_navigation_matches(&mut state);
+                            self.mark_dirty();
+                        }
+                    }
+                    KeyCode::Up => {
+                        state.select_previous_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::Down => {
+                        state.select_next_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::PageUp => {
+                        state.page_previous_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::PageDown => {
+                        state.page_next_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::Char(ch)
+                        if matches!(ch, 'h' | 'H')
+                            && (modifiers.contains(KeyModifiers::CONTROL) || !state.editing) =>
+                    {
+                        self.action_menu_mode = ActionMenuMode::Root;
+                        self.action_menu_items = self.build_action_menu_entries();
+                        self.action_menu_selected = self
+                            .action_menu_items
+                            .iter()
+                            .enumerate()
+                            .find(|(_, entry)| entry.enabled)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                        self.status_message =
+                            "Actions: j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Esc/o back"
+                                .to_string();
+                        self.mark_dirty();
+                        return Ok(false);
+                    }
+                    KeyCode::Char(ch)
+                        if matches!(ch, 'k' | 'K')
+                            && (modifiers.contains(KeyModifiers::CONTROL) || !state.editing) =>
+                    {
+                        state.select_previous_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::Char(ch)
+                        if matches!(ch, 'j' | 'J')
+                            && (modifiers.contains(KeyModifiers::CONTROL) || !state.editing) =>
+                    {
+                        state.select_next_enabled();
+                        self.mark_dirty();
+                    }
+                    KeyCode::Char(ch)
+                        if state.editing
+                            && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        state.filter.push(ch);
+                        self.refresh_navigation_matches(&mut state);
+                        self.mark_dirty();
+                    }
+                    _ => {}
+                }
+
+                self.action_menu_mode = ActionMenuMode::Navigation(state);
+                return Ok(false);
+            }
         }
 
-        let index = self
-            .link_menu_selected
-            .min(self.link_menu_items.len().saturating_sub(1));
-        let entry = &self.link_menu_items[index];
-        let label = entry.label.clone();
-        let url = entry.url.clone();
+        Ok(false)
+    }
 
-        match webbrowser::open(&url) {
-            Ok(_) => {
-                let message = format!("Opened {label} in your browser.");
-                self.dismiss_link_menu(None);
-                self.status_message = message;
-                self.mark_dirty();
+    fn draw_action_menu(&self, frame: &mut Frame<'_>, area: Rect) {
+        match &self.action_menu_mode {
+            ActionMenuMode::Root => self.draw_action_menu_root(frame, area),
+            ActionMenuMode::Links => self.draw_action_menu_links(frame, area),
+            ActionMenuMode::Navigation(state) => {
+                self.draw_action_menu_navigation(frame, area, state)
             }
-            Err(err) => {
-                self.status_message = format!("Failed to open {label}: {err} (URL: {url})");
-                self.mark_dirty();
+        }
+    }
+
+    fn draw_action_menu_root(&self, frame: &mut Frame<'_>, area: Rect) {
+        let popup_area = centered_rect(64, 52, area);
+        frame.render_widget(Clear, popup_area);
+
+        let items: Vec<ListItem> = if self.action_menu_items.is_empty() {
+            vec![ListItem::new(vec![Line::from(Span::styled(
+                "No actions available",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .bg(COLOR_PANEL_BG)
+                    .add_modifier(Modifier::ITALIC),
+            ))])]
+        } else {
+            self.action_menu_items
+                .iter()
+                .map(|entry| {
+                    let style = if entry.enabled {
+                        Style::default()
+                            .fg(COLOR_TEXT_PRIMARY)
+                            .bg(COLOR_PANEL_BG)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(COLOR_TEXT_SECONDARY)
+                            .bg(COLOR_PANEL_BG)
+                            .add_modifier(Modifier::ITALIC)
+                    };
+                    ListItem::new(vec![
+                        Line::from(Span::styled(entry.label.clone(), style)),
+                        Line::default(),
+                    ])
+                })
+                .collect()
+        };
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        "Actions",
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_ACCENT))
+                    .style(Style::default().bg(COLOR_PANEL_BG))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(COLOR_TEXT_PRIMARY)
+                    .bg(COLOR_PANEL_SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(popup_area);
+
+        let mut state = ListState::default();
+        if !self.action_menu_items.is_empty() {
+            state.select(Some(
+                self.action_menu_selected
+                    .min(self.action_menu_items.len().saturating_sub(1)),
+            ));
+        }
+
+        frame.render_stateful_widget(list, chunks[0], &mut state);
+
+        let instructions = Paragraph::new(vec![
+            Line::raw(""),
+            Line::from(Span::raw(
+                "j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Esc/o back",
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .bg(COLOR_PANEL_BG)
+                .add_modifier(Modifier::ITALIC),
+        );
+        frame.render_widget(instructions, chunks[1]);
+    }
+
+    fn draw_action_menu_links(&self, frame: &mut Frame<'_>, area: Rect) {
+        let popup_area = centered_rect(70, 60, area);
+        frame.render_widget(Clear, popup_area);
+
+        let mut items: Vec<ListItem> = Vec::new();
+        if self.action_link_items.is_empty() {
+            items.push(ListItem::new(vec![Line::from(Span::styled(
+                "No links available",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .bg(COLOR_PANEL_BG)
+                    .add_modifier(Modifier::ITALIC),
+            ))]));
+        } else {
+            for entry in &self.action_link_items {
+                let lines = vec![
+                    Line::from(Span::styled(
+                        entry.label.clone(),
+                        Style::default()
+                            .fg(COLOR_TEXT_PRIMARY)
+                            .bg(COLOR_PANEL_BG)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        entry.url.clone(),
+                        Style::default().fg(COLOR_ACCENT).bg(COLOR_PANEL_BG),
+                    )),
+                    Line::default(),
+                ];
+                items.push(ListItem::new(lines));
             }
         }
 
-        Ok(())
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        "Links",
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_ACCENT))
+                    .style(Style::default().bg(COLOR_PANEL_BG)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(COLOR_TEXT_PRIMARY)
+                    .bg(COLOR_PANEL_SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(popup_area);
+
+        let mut state = ListState::default();
+        if !self.action_link_items.is_empty() {
+            state.select(Some(
+                self.action_menu_selected
+                    .min(self.action_link_items.len().saturating_sub(1)),
+            ));
+        }
+
+        frame.render_stateful_widget(list, chunks[0], &mut state);
+
+        let instructions =
+            Paragraph::new("j/k move · Ctrl+H/J/K/L navigate · Enter/l open · h/Ctrl+H/Esc back")
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(COLOR_TEXT_SECONDARY)
+                        .bg(COLOR_PANEL_BG)
+                        .add_modifier(Modifier::ITALIC),
+                );
+        frame.render_widget(instructions, chunks[1]);
+    }
+
+    fn draw_action_menu_navigation(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &NavigationMenuState,
+    ) {
+        let popup_area = centered_rect(70, 60, area);
+        frame.render_widget(Clear, popup_area);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
+            .split(popup_area);
+
+        let prompt_style = if state.editing {
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .bg(COLOR_PANEL_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_TEXT_SECONDARY).bg(COLOR_PANEL_BG)
+        };
+        let prompt_label = if state.editing {
+            "Search (typing):"
+        } else {
+            "Search:"
+        };
+        let filter_line = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(prompt_label, prompt_style),
+                Span::raw(" "),
+                Span::styled(
+                    state.filter.as_str(),
+                    Style::default()
+                        .fg(COLOR_TEXT_PRIMARY)
+                        .bg(COLOR_PANEL_BG)
+                        .add_modifier(if state.editing {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]),
+            Line::raw(""),
+        ])
+        .style(Style::default().bg(COLOR_PANEL_BG))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(filter_line, layout[0]);
+
+        let mut items: Vec<ListItem> = Vec::new();
+        if state.matches.is_empty() {
+            items.push(ListItem::new(vec![Line::from(Span::styled(
+                "No matches",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .bg(COLOR_PANEL_BG)
+                    .add_modifier(Modifier::ITALIC),
+            ))]));
+        } else {
+            for entry in &state.matches {
+                let label_style = if entry.enabled {
+                    Style::default()
+                        .fg(COLOR_TEXT_PRIMARY)
+                        .bg(COLOR_PANEL_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(COLOR_TEXT_SECONDARY)
+                        .bg(COLOR_PANEL_BG)
+                        .add_modifier(Modifier::ITALIC)
+                };
+
+                let mut lines = vec![Line::from(Span::styled(entry.label.clone(), label_style))];
+
+                if let Some(description) = &entry.description {
+                    lines.push(Line::from(Span::styled(
+                        description.clone(),
+                        Style::default()
+                            .fg(COLOR_TEXT_SECONDARY)
+                            .bg(COLOR_PANEL_BG)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+                lines.push(Line::default());
+                items.push(ListItem::new(lines));
+            }
+        }
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        "Navigation",
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_ACCENT))
+                    .style(Style::default().bg(COLOR_PANEL_BG))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(COLOR_TEXT_PRIMARY)
+                    .bg(COLOR_PANEL_SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        let mut stateful = ListState::default();
+        if !state.matches.is_empty() {
+            let index = state.selected.min(state.matches.len().saturating_sub(1));
+            stateful.select(Some(index));
+        }
+        frame.render_stateful_widget(list, layout[1], &mut stateful);
+
+        let instructions = Paragraph::new(vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(
+                    "Type to search",
+                    Style::default()
+                        .fg(COLOR_TEXT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" · Tab toggle typing · Esc clear/close"),
+            ]),
+            Line::from(vec![Span::raw(
+                "Ctrl+H/J/K/L navigate even when typing · Enter/l open · h back",
+            )]),
+        ])
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .bg(COLOR_PANEL_BG)
+                .add_modifier(Modifier::ITALIC),
+        );
+        frame.render_widget(instructions, layout[2]);
     }
 
     fn open_support_link(&mut self) -> Result<()> {
@@ -3307,7 +4821,7 @@ impl Model {
         self.menu_form = MenuForm::default();
         self.menu_screen = MenuScreen::Accounts;
         self.queue_active_kitty_delete();
-        self.dismiss_link_menu(None);
+        self.close_action_menu(None);
         self.menu_visible = true;
 
         let status = match self.refresh_menu_accounts() {
@@ -3629,7 +5143,7 @@ impl Model {
                         self.comment_status = format!("Failed to load comments: {err}");
                     }
                 }
-                self.dismiss_link_menu(None);
+                self.close_action_menu(None);
                 self.mark_dirty();
             }
             AsyncResponse::Content {
@@ -3679,11 +5193,33 @@ impl Model {
                             .cloned()
                             .unwrap_or_else(|| "r/frontpage".to_string());
 
+                        let custom_targets: Vec<String> = self
+                            .subreddits
+                            .iter()
+                            .filter(|name| {
+                                matches!(
+                                    classify_feed_target(name),
+                                    FeedKind::User(_) | FeedKind::Search(_)
+                                )
+                            })
+                            .cloned()
+                            .collect();
+
                         self.subreddits = names
                             .into_iter()
                             .map(|name| normalize_subreddit_name(&name))
                             .collect();
                         ensure_core_subreddits(&mut self.subreddits);
+
+                        for extra in custom_targets {
+                            if !self
+                                .subreddits
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(&extra))
+                            {
+                                self.subreddits.push(extra);
+                            }
+                        }
 
                         if let Some(idx) = self
                             .subreddits
@@ -3738,6 +5274,34 @@ impl Model {
                     .map(|post| post.post.name.as_str());
                 if current == Some(post_name.as_str()) {
                     self.sync_content_from_selection();
+                }
+                self.mark_dirty();
+            }
+            AsyncResponse::MediaSave { result } => {
+                self.media_save_in_progress = None;
+                if self.action_menu_visible {
+                    self.action_menu_items = self.build_action_menu_entries();
+                    if self.action_menu_selected >= self.action_menu_items.len() {
+                        self.action_menu_selected = self.action_menu_items.len().saturating_sub(1);
+                    }
+                }
+
+                match result {
+                    Ok(outcome) => {
+                        let count = outcome.saved_paths.len();
+                        self.status_message = if count == 1 {
+                            outcome
+                                .saved_paths
+                                .first()
+                                .map(|path| format!("Saved media to {}", path.display()))
+                                .unwrap_or_else(|| "Saved media.".to_string())
+                        } else {
+                            format!("Saved {} files to {}", count, outcome.dest_dir.display())
+                        };
+                    }
+                    Err(err) => {
+                        self.status_message = format!("Failed to save media: {}", err);
+                    }
                 }
                 self.mark_dirty();
             }
@@ -4328,7 +5892,7 @@ impl Model {
         if changed {
             self.queue_active_kitty_delete();
             self.comment_offset.set(0);
-            self.dismiss_link_menu(None);
+            self.close_action_menu(None);
             self.sync_content_from_selection();
             if let Err(err) = self.load_comments_for_selection() {
                 self.comment_status = format!("Failed to load comments: {err}");
@@ -4469,7 +6033,8 @@ impl Model {
         };
 
         let style = Style::default();
-        let mut height = wrap_plain(name, width, style).len().saturating_add(1);
+        let display = navigation_display_name(name);
+        let mut height = wrap_plain(&display, width, style).len().saturating_add(1);
         if height == 0 {
             height = 1;
         }
@@ -4778,6 +6343,7 @@ impl Model {
         from_cache: bool,
         mode: LoadMode,
     ) {
+        let label = navigation_display_name(target);
         match mode {
             LoadMode::Replace => {
                 if batch.posts.is_empty() {
@@ -4785,16 +6351,17 @@ impl Model {
                         if let Some(fallback) = fallback_feed_target(target) {
                             if self.select_subreddit_by_name(fallback) {
                                 self.feed_after = None;
+                                let fallback_label = navigation_display_name(fallback);
                                 self.status_message = format!(
                                     "No posts available for {} ({}) — loading {} instead...",
-                                    target,
+                                    label,
                                     sort_label(sort),
-                                    fallback
+                                    fallback_label
                                 );
                                 if let Err(err) = self.reload_posts() {
                                     self.status_message = format!(
                                         "Tried {}, but failed to load posts: {}",
-                                        fallback, err
+                                        fallback_label, err
                                     );
                                 }
                                 self.mark_dirty();
@@ -4806,7 +6373,7 @@ impl Model {
                     let source = if from_cache { "(cached)" } else { "" };
                     self.status_message = format!(
                         "No posts available for {} ({}) {}",
-                        target,
+                        label,
                         sort_label(sort),
                         source
                     )
@@ -4826,7 +6393,7 @@ impl Model {
                     self.comment_offset.set(0);
                     self.comment_status = "No comments available.".to_string();
                     self.selected_comment = 0;
-                    self.dismiss_link_menu(None);
+                    self.close_action_menu(None);
                     self.content_cache.clear();
                     self.post_rows.clear();
                     self.post_rows_width = 0;
@@ -4846,14 +6413,14 @@ impl Model {
                     format!(
                         "Loaded {} posts from {} ({}) — cached",
                         batch.posts.len(),
-                        target,
+                        label,
                         sort_label(sort)
                     )
                 } else {
                     format!(
                         "Loaded {} posts from {} ({})",
                         batch.posts.len(),
-                        target,
+                        label,
                         sort_label(sort)
                     )
                 };
@@ -4862,7 +6429,7 @@ impl Model {
                 self.feed_after = batch.after;
                 self.post_offset.set(0);
                 self.comment_offset.set(0);
-                self.dismiss_link_menu(None);
+                self.close_action_menu(None);
                 self.numeric_jump = None;
                 self.media_previews
                     .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
@@ -4908,18 +6475,18 @@ impl Model {
                     if self.feed_after.is_none() || self.feed_after == previous_after {
                         if self.feed_after.is_none() {
                             self.status_message =
-                                format!("Reached end of {} ({})", target, sort_label(sort));
+                                format!("Reached end of {} ({})", label, sort_label(sort));
                         } else {
                             self.status_message = format!(
                                 "No additional posts returned for {} ({}).",
-                                target,
+                                label,
                                 sort_label(sort)
                             );
                         }
                     } else {
                         self.status_message = format!(
                             "No additional posts returned yet for {} ({}); requesting more...",
-                            target,
+                            label,
                             sort_label(sort)
                         );
                         self.maybe_request_more_posts();
@@ -4941,13 +6508,13 @@ impl Model {
                     if self.feed_after.is_none() || self.feed_after == previous_after {
                         if self.feed_after.is_none() {
                             self.status_message =
-                                format!("Reached end of {} ({})", target, sort_label(sort));
+                                format!("Reached end of {} ({})", label, sort_label(sort));
                         } else {
                             self.status_message = format!(
                                 "Skipped {} duplicate post{} from {} ({}).",
                                 original_incoming,
                                 if original_incoming == 1 { "" } else { "s" },
-                                target,
+                                label,
                                 sort_label(sort)
                             );
                         }
@@ -4956,7 +6523,7 @@ impl Model {
                             "Skipped {} duplicate post{} from {} ({}); requesting more...",
                             original_incoming,
                             if original_incoming == 1 { "" } else { "s" },
-                            target,
+                            label,
                             sort_label(sort)
                         );
                         self.maybe_request_more_posts();
@@ -4969,7 +6536,7 @@ impl Model {
                 self.status_message = format!(
                     "Loaded {} more posts from {} ({}) — {} total.",
                     added,
-                    target,
+                    label,
                     sort_label(sort),
                     self.posts.len()
                 );
@@ -4985,6 +6552,7 @@ impl Model {
             || self.pending_content.is_some()
             || self.login_in_progress
             || !self.pending_media.is_empty()
+            || self.media_save_in_progress.is_some()
     }
 
     fn reload_posts(&mut self) -> Result<()> {
@@ -5053,21 +6621,25 @@ impl Model {
             mode: LoadMode::Replace,
         });
         self.feed_after = None;
-        self.status_message = format!("Loading {} ({})...", target, sort_label(sort));
+        let feed_kind = classify_feed_target(&target);
+        let label = navigation_display_name(&target);
+        self.status_message = match feed_kind {
+            FeedKind::Search(query) => {
+                format!(
+                    "Searching Reddit for \"{}\" ({})...",
+                    query,
+                    sort_label(sort)
+                )
+            }
+            FeedKind::User(user) => {
+                format!("Loading u/{} ({})...", user, sort_label(sort))
+            }
+            _ => format!("Loading {} ({})...", label, sort_label(sort)),
+        };
         self.spinner.reset();
 
         let tx = self.response_tx.clone();
         let service = service.clone();
-        let subreddit = if is_front_page(&target) {
-            None
-        } else {
-            Some(
-                target
-                    .trim_start_matches("r/")
-                    .trim_start_matches('/')
-                    .to_string(),
-            )
-        };
         let target_for_thread = target.clone();
         let opts = reddit::ListingOptions {
             after: None,
@@ -5078,28 +6650,55 @@ impl Model {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
-            let result = match subreddit.as_ref() {
-                Some(name) => service
-                    .load_subreddit(name, sort, opts.clone())
-                    .map(|listing| PostBatch {
-                        after: listing.after,
-                        posts: listing
-                            .children
-                            .into_iter()
-                            .map(|thing| make_preview(thing.data))
-                            .collect::<Vec<_>>(),
-                    }),
-                None => service
-                    .load_front_page(sort, opts.clone())
-                    .map(|listing| PostBatch {
-                        after: listing.after,
-                        posts: listing
-                            .children
-                            .into_iter()
-                            .map(|thing| make_preview(thing.data))
-                            .collect::<Vec<_>>(),
-                    }),
-            };
+            let result =
+                match classify_feed_target(&target_for_thread) {
+                    FeedKind::FrontPage => {
+                        service
+                            .load_front_page(sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                    FeedKind::Subreddit(name) => service
+                        .load_subreddit(name, sort, opts.clone())
+                        .map(|listing| PostBatch {
+                            after: listing.after,
+                            posts: listing
+                                .children
+                                .into_iter()
+                                .map(|thing| make_preview(thing.data))
+                                .collect::<Vec<_>>(),
+                        }),
+                    FeedKind::User(name) => {
+                        service
+                            .load_user(name, sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                    FeedKind::Search(query) => {
+                        service
+                            .search_posts(query, sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                };
 
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
@@ -5141,25 +6740,29 @@ impl Model {
             cancel_flag: cancel_flag.clone(),
             mode: LoadMode::Append,
         });
-        self.status_message = format!(
-            "Loading more posts from {} ({})...",
-            target,
-            sort_label(sort)
-        );
+        let feed_kind = classify_feed_target(&target);
+        let label = navigation_display_name(&target);
+        self.status_message = match feed_kind {
+            FeedKind::Search(query) => format!(
+                "Searching for additional posts matching \"{}\" ({})...",
+                query,
+                sort_label(sort)
+            ),
+            FeedKind::User(user) => format!(
+                "Loading more posts from u/{} ({})...",
+                user,
+                sort_label(sort)
+            ),
+            _ => format!(
+                "Loading more posts from {} ({})...",
+                label,
+                sort_label(sort)
+            ),
+        };
         self.spinner.reset();
 
         let tx = self.response_tx.clone();
         let service = service.clone();
-        let subreddit = if is_front_page(&target) {
-            None
-        } else {
-            Some(
-                target
-                    .trim_start_matches("r/")
-                    .trim_start_matches('/')
-                    .to_string(),
-            )
-        };
         let target_for_thread = target.clone();
         let opts = reddit::ListingOptions {
             after: Some(after),
@@ -5170,28 +6773,55 @@ impl Model {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
-            let result = match subreddit.as_ref() {
-                Some(name) => service
-                    .load_subreddit(name, sort, opts.clone())
-                    .map(|listing| PostBatch {
-                        after: listing.after,
-                        posts: listing
-                            .children
-                            .into_iter()
-                            .map(|thing| make_preview(thing.data))
-                            .collect::<Vec<_>>(),
-                    }),
-                None => service
-                    .load_front_page(sort, opts.clone())
-                    .map(|listing| PostBatch {
-                        after: listing.after,
-                        posts: listing
-                            .children
-                            .into_iter()
-                            .map(|thing| make_preview(thing.data))
-                            .collect::<Vec<_>>(),
-                    }),
-            };
+            let result =
+                match classify_feed_target(&target_for_thread) {
+                    FeedKind::FrontPage => {
+                        service
+                            .load_front_page(sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                    FeedKind::Subreddit(name) => service
+                        .load_subreddit(name, sort, opts.clone())
+                        .map(|listing| PostBatch {
+                            after: listing.after,
+                            posts: listing
+                                .children
+                                .into_iter()
+                                .map(|thing| make_preview(thing.data))
+                                .collect::<Vec<_>>(),
+                        }),
+                    FeedKind::User(name) => {
+                        service
+                            .load_user(name, sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                    FeedKind::Search(query) => {
+                        service
+                            .search_posts(query, sort, opts.clone())
+                            .map(|listing| PostBatch {
+                                after: listing.after,
+                                posts: listing
+                                    .children
+                                    .into_iter()
+                                    .map(|thing| make_preview(thing.data))
+                                    .collect::<Vec<_>>(),
+                            })
+                    }
+                };
 
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
@@ -5326,7 +6956,7 @@ impl Model {
             self.comment_offset.set(0);
             self.comment_status = "Sign in to load comments.".to_string();
             self.pending_comments = None;
-            self.dismiss_link_menu(None);
+            self.close_action_menu(None);
             return Ok(());
         };
 
@@ -5337,7 +6967,7 @@ impl Model {
             self.comment_offset.set(0);
             self.comment_status = "Select a post to load comments.".to_string();
             self.pending_comments = None;
-            self.dismiss_link_menu(None);
+            self.close_action_menu(None);
             return Ok(());
         };
 
@@ -5366,7 +6996,7 @@ impl Model {
                     }
                 }
                 self.pending_comments = None;
-                self.dismiss_link_menu(None);
+                self.close_action_menu(None);
                 return Ok(());
             }
         }
@@ -5390,7 +7020,7 @@ impl Model {
         self.collapsed_comments.clear();
         self.visible_comment_indices.clear();
         self.spinner.reset();
-        self.dismiss_link_menu(None);
+        self.close_action_menu(None);
 
         let tx = self.response_tx.clone();
         let service = service.clone();
@@ -5481,15 +7111,15 @@ impl Model {
             self.draw_menu(frame, layout[1]);
         }
 
-        if self.link_menu_visible {
-            self.draw_link_menu(frame, layout[1]);
+        if self.action_menu_visible {
+            self.draw_action_menu(frame, layout[1]);
         }
     }
 
     fn flush_inline_images(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
         self.flush_pending_kitty_deletes(backend)?;
 
-        if self.link_menu_visible || self.menu_visible {
+        if self.action_menu_visible || self.menu_visible {
             self.needs_kitty_flush = true;
             self.emit_active_kitty_delete(backend)?;
             return Ok(());
@@ -5793,7 +7423,8 @@ impl Model {
             if is_selected || is_active {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            let mut lines = wrap_plain(name, width, style);
+            let display = navigation_display_name(name);
+            let mut lines = wrap_plain(&display, width, style);
             lines.push(Line::from(Span::styled(
                 String::new(),
                 Style::default().bg(background),
@@ -6313,86 +7944,6 @@ impl Model {
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(menu, popup_area);
-    }
-
-    fn draw_link_menu(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup_area = centered_rect(70, 60, area);
-        frame.render_widget(Clear, popup_area);
-
-        let mut items: Vec<ListItem> = Vec::new();
-        if self.link_menu_items.is_empty() {
-            items.push(ListItem::new(vec![Line::from(Span::styled(
-                "No links available",
-                Style::default()
-                    .fg(COLOR_TEXT_SECONDARY)
-                    .bg(COLOR_PANEL_BG)
-                    .add_modifier(Modifier::ITALIC),
-            ))]));
-        } else {
-            for entry in &self.link_menu_items {
-                let lines = vec![
-                    Line::from(Span::styled(
-                        entry.label.clone(),
-                        Style::default()
-                            .fg(COLOR_TEXT_PRIMARY)
-                            .bg(COLOR_PANEL_BG)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
-                        entry.url.clone(),
-                        Style::default().fg(COLOR_ACCENT).bg(COLOR_PANEL_BG),
-                    )),
-                    Line::default(),
-                ];
-                items.push(ListItem::new(lines));
-            }
-        }
-
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        "Links",
-                        Style::default()
-                            .fg(COLOR_ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_ACCENT))
-                    .style(Style::default().bg(COLOR_PANEL_BG)),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(COLOR_TEXT_PRIMARY)
-                    .bg(COLOR_PANEL_SELECTED_BG)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(popup_area);
-
-        let mut state = ListState::default();
-        if !self.link_menu_items.is_empty() {
-            state.select(Some(
-                self.link_menu_selected
-                    .min(self.link_menu_items.len().saturating_sub(1)),
-            ));
-        }
-
-        frame.render_stateful_widget(list, chunks[0], &mut state);
-
-        let instructions = Paragraph::new("j/k move · Enter open · Esc/q close")
-            .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(COLOR_TEXT_SECONDARY)
-                    .bg(COLOR_PANEL_BG)
-                    .add_modifier(Modifier::ITALIC),
-            );
-        frame.render_widget(instructions, chunks[1]);
     }
 
     fn menu_field_line(&self, field: MenuField) -> Line<'static> {

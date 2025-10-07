@@ -79,6 +79,25 @@ impl SortOption {
     }
 }
 
+fn sanitize_username(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("reddit: username required");
+    }
+    let without_slashes = trimmed.trim_start_matches('/');
+    let rest = without_slashes
+        .strip_prefix("u/")
+        .or_else(|| without_slashes.strip_prefix("U/"))
+        .or_else(|| without_slashes.strip_prefix("user/"))
+        .unwrap_or(without_slashes)
+        .trim_start_matches('/');
+    let normalized = rest.trim();
+    if normalized.is_empty() {
+        bail!("reddit: username required");
+    }
+    Ok(normalized.to_string())
+}
+
 pub struct Client {
     token_provider: Arc<dyn TokenProvider>,
     http: HttpClient,
@@ -143,6 +162,34 @@ impl Client {
 
     pub fn front_page(&self, sort: SortOption, opts: ListingOptions) -> Result<Listing<Post>> {
         self.subreddit_listing("", sort, opts)
+    }
+
+    pub fn user_listing(
+        &self,
+        username: &str,
+        sort: SortOption,
+        mut opts: ListingOptions,
+    ) -> Result<Listing<Post>> {
+        let normalized = sanitize_username(username)?;
+        let path = format!("/user/{}/submitted.json", normalized);
+        opts.extra.push(("sort".into(), sort.as_str().to_string()));
+        self.fetch_listing(&path, opts)
+    }
+
+    pub fn search_posts(
+        &self,
+        query: &str,
+        sort: SortOption,
+        mut opts: ListingOptions,
+    ) -> Result<Listing<Post>> {
+        let cleaned = query.trim();
+        if cleaned.is_empty() {
+            bail!("reddit: search query required");
+        }
+        opts.extra.push(("q".into(), cleaned.to_string()));
+        opts.extra.push(("sort".into(), sort.as_str().to_string()));
+        opts.extra.push(("type".into(), "link".into()));
+        self.fetch_listing("/search.json", opts)
     }
 
     pub fn comments(

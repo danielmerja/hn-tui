@@ -20,6 +20,18 @@ pub trait FeedService: Send + Sync {
         sort: SortOption,
         opts: reddit::ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>>;
+    fn load_user(
+        &self,
+        name: &str,
+        sort: SortOption,
+        opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>>;
+    fn search_posts(
+        &self,
+        query: &str,
+        sort: SortOption,
+        opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>>;
 }
 
 pub trait CommentService: Send + Sync {
@@ -91,6 +103,28 @@ impl FeedService for RedditFeedService {
         self.client
             .subreddit_listing(name, sort, opts)
             .context("fetch subreddit feed")
+    }
+
+    fn load_user(
+        &self,
+        name: &str,
+        sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        self.client
+            .user_listing(name, sort, opts)
+            .context("fetch user submissions")
+    }
+
+    fn search_posts(
+        &self,
+        query: &str,
+        sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        self.client
+            .search_posts(query, sort, opts)
+            .context("search reddit")
     }
 }
 
@@ -199,6 +233,24 @@ impl FeedService for MockFeedService {
         _opts: reddit::ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>> {
         Ok(mock_listing(&format!("Sample posts for {name}")))
+    }
+
+    fn load_user(
+        &self,
+        name: &str,
+        _sort: SortOption,
+        _opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        Ok(mock_listing(&format!("User posts for u/{name}")))
+    }
+
+    fn search_posts(
+        &self,
+        query: &str,
+        _sort: SortOption,
+        _opts: reddit::ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        Ok(mock_listing(&format!("Search results for {query}")))
     }
 }
 

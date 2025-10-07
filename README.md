@@ -27,7 +27,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ck-zhang/reddix/release
 2. Launch `reddix`, press `m`, and follow the guided menu for setup.
 3. Prefer to configure things manually? Copy [`docs/examples/config.yaml`](docs/examples/config.yaml) into `~/.config/reddix/config.yaml` and fill in your credentials.
 
-Core shortcuts: `j/k` move, `h/l` change panes, `m` menu, `o` link menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
+Core shortcuts: `j/k` move, `h/l` change panes, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
 
 ## Support
 - Feature requests and contributions are welcome, this project is in its very early stage.
