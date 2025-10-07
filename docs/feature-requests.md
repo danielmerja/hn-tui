@@ -16,6 +16,7 @@ This document tracks community requests and ideas for future Reddix releases.
 - Add link yanking so numbered hints jump to external open actions.
 - Support additional inline image protocols beyond kitty graphics.
 - Restore optional clipboard copy for outbound links.
+- Full-screen image view that temporarily fills the terminal for easier reading.
 
 ## Completed Requests
 
