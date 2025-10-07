@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.14] - 2025-10-07
+### Added
+- Command palette with fuzzy subreddit/user search and consolidated actions menu access.
+- Full-resolution media saver that queues downloads without blocking the UI.
+### Changed
+- Navigation keys now respect typing mode so overlays no longer hijack text input.
+
 ## [0.1.13] - 2025-10-07
 ### Changed
 - Wrapped subreddit sort shortcuts so the navigation pane stays readable on narrow terminals.
@@ -73,7 +80,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/ck-zhang/reddix/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/ck-zhang/reddix/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/ck-zhang/reddix/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/ck-zhang/reddix/compare/v0.1.10...v0.1.11
