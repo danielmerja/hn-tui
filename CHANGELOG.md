@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Nothing yet.
+
+## [0.1.15] - 2025-10-08
 ### Added
 - Comment sorting controls that mirror the post sort workflow, with a top-of-pane picker and `t` shortcut.
 
@@ -81,7 +84,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/ck-zhang/reddix/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/ck-zhang/reddix/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/ck-zhang/reddix/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/ck-zhang/reddix/compare/v0.1.11...v0.1.12
