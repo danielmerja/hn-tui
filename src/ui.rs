@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use arboard::Clipboard;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -521,6 +522,7 @@ fn collect_comments(
         entries.push(CommentEntry {
             name: comment.name.clone(),
             author: comment.author.clone(),
+            raw_body: comment.body.clone(),
             body: clean_body,
             score: comment.score,
             likes: comment.likes,
@@ -833,6 +835,7 @@ impl MenuForm {
 struct CommentEntry {
     name: String,
     author: String,
+    raw_body: String,
     body: String,
     score: i64,
     likes: Option<bool>,
@@ -2346,6 +2349,32 @@ fn clamp_dimensions(width: i64, height: i64, max_width: i32, max_height: i32) ->
     (cols.clamp(1, max_cols), rows.clamp(1, max_rows))
 }
 
+fn copy_to_clipboard(state: &mut Option<Clipboard>, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    if state.is_none() {
+        *state = Some(Clipboard::new().context("open system clipboard")?);
+    }
+
+    if let Some(clipboard) = state.as_mut() {
+        let payload = text.to_string();
+        match clipboard.set_text(payload.clone()) {
+            Ok(()) => return Ok(()),
+            Err(_err) => {
+                *state = None;
+                let mut fresh = Clipboard::new().context("reopen system clipboard")?;
+                fresh.set_text(payload).context("write text to clipboard")?;
+                *state = Some(fresh);
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub status_message: String,
@@ -2451,6 +2480,7 @@ pub struct Model {
     pending_posts: Option<PendingPosts>,
     pending_comments: Option<PendingComments>,
     pending_subreddits: Option<PendingSubreddits>,
+    clipboard: Option<Clipboard>,
 }
 
 impl Model {
@@ -3118,6 +3148,7 @@ impl Model {
             pending_posts: None,
             pending_comments: None,
             pending_subreddits: None,
+            clipboard: None,
         };
         model.cache_scope = model.current_cache_scope();
         model.subreddits = model
@@ -3420,6 +3451,14 @@ impl Model {
                 if self.focused_pane == Pane::Comments {
                     self.expand_all_comments();
                     dirty = true;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if self.focused_pane == Pane::Comments && !self.comment_sort_selected {
+                    if let Err(err) = self.copy_selected_comment() {
+                        self.status_message = format!("Failed to copy comment: {err}");
+                        self.mark_dirty();
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -5851,6 +5890,42 @@ impl Model {
                 error,
             });
         });
+    }
+
+    fn copy_selected_comment(&mut self) -> Result<()> {
+        let Some(comment_index) = self.selected_comment_index() else {
+            self.status_message = "Select a comment to copy first.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        let (text, author_label) = match self.comments.get(comment_index) {
+            Some(comment) => {
+                let cleaned = comment.raw_body.trim_end().to_string();
+                let label = if comment.author.trim().is_empty() {
+                    "[deleted]".to_string()
+                } else {
+                    format!("u/{}", comment.author.trim())
+                };
+                (cleaned, label)
+            }
+            None => {
+                self.status_message = "Comment selection is out of sync.".to_string();
+                self.mark_dirty();
+                return Ok(());
+            }
+        };
+
+        if text.trim().is_empty() {
+            self.status_message = "Selected comment has no text to copy.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        copy_to_clipboard(&mut self.clipboard, &text)?;
+        self.status_message = format!("Copied comment by {} to the clipboard.", author_label);
+        self.mark_dirty();
+        Ok(())
     }
 
     fn selected_comment_index(&self) -> Option<usize> {
@@ -8729,6 +8804,7 @@ impl Model {
                     parts.push("Comments: j/k move, c fold, Shift+C expand".to_string());
                     parts.push("Votes: u upvote, d downvote".to_string());
                     parts.push("Sort: t or ↑ at top; ←/→ cycle".to_string());
+                    parts.push("Copy: y copy comment".to_string());
                 }
             }
         }

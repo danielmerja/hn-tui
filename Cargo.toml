@@ -45,6 +45,7 @@ tree_magic_mini = "3.2"
 libc = "0.2"
 unicode-width = "0.1"
 semver = "1.0"
+arboard = "3.3"
 
 [dev-dependencies]
 assert_cmd = "2.0"
