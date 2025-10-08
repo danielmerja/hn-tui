@@ -124,6 +124,14 @@ const NAV_SORTS: [reddit::SortOption; 5] = [
     reddit::SortOption::Top,
     reddit::SortOption::Rising,
 ];
+const COMMENT_SORTS: [reddit::CommentSortOption; 6] = [
+    reddit::CommentSortOption::Confidence,
+    reddit::CommentSortOption::Top,
+    reddit::CommentSortOption::New,
+    reddit::CommentSortOption::Controversial,
+    reddit::CommentSortOption::Old,
+    reddit::CommentSortOption::Qa,
+];
 const FEED_CACHE_TTL: Duration = Duration::from_secs(45);
 const COMMENT_CACHE_TTL: Duration = Duration::from_secs(120);
 const FEED_CACHE_MAX: usize = 16;
@@ -867,6 +875,7 @@ struct PendingComments {
     request_id: u64,
     post_name: String,
     cancel_flag: Arc<AtomicBool>,
+    sort: reddit::CommentSortOption,
 }
 
 struct PendingSubreddits {
@@ -911,6 +920,7 @@ enum AsyncResponse {
     Comments {
         request_id: u64,
         post_name: String,
+        sort: reddit::CommentSortOption,
         result: Result<Vec<CommentEntry>>,
     },
     Content {
@@ -1244,6 +1254,21 @@ struct FeedCacheEntry {
     batch: PostBatch,
     fetched_at: Instant,
     scope: CacheScope,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CommentCacheKey {
+    post_name: String,
+    sort: reddit::CommentSortOption,
+}
+
+impl CommentCacheKey {
+    fn new(post_name: &str, sort: reddit::CommentSortOption) -> Self {
+        Self {
+            post_name: post_name.to_string(),
+            sort,
+        }
+    }
 }
 
 struct CommentCacheEntry {
@@ -1934,6 +1959,17 @@ fn sort_label(sort: reddit::SortOption) -> &'static str {
     }
 }
 
+fn comment_sort_label(sort: reddit::CommentSortOption) -> &'static str {
+    match sort {
+        reddit::CommentSortOption::Confidence => "/best",
+        reddit::CommentSortOption::Top => "/top",
+        reddit::CommentSortOption::New => "/new",
+        reddit::CommentSortOption::Controversial => "/controversial",
+        reddit::CommentSortOption::Old => "/old",
+        reddit::CommentSortOption::Qa => "/qa",
+    }
+}
+
 fn image_label(url: &str) -> String {
     Url::parse(url)
         .ok()
@@ -2319,6 +2355,7 @@ pub struct Options {
     pub feed_service: Option<Arc<dyn FeedService + Send + Sync>>,
     pub subreddit_service: Option<Arc<dyn SubredditService + Send + Sync>>,
     pub default_sort: reddit::SortOption,
+    pub default_comment_sort: reddit::CommentSortOption,
     pub comment_service: Option<Arc<dyn CommentService + Send + Sync>>,
     pub interaction_service: Option<Arc<dyn InteractionService + Send + Sync>>,
     pub media_handle: Option<media::Handle>,
@@ -2347,7 +2384,7 @@ pub struct Model {
     media_layouts: HashMap<String, MediaLayout>,
     media_handle: Option<media::Handle>,
     feed_cache: HashMap<FeedCacheKey, FeedCacheEntry>,
-    comment_cache: HashMap<String, CommentCacheEntry>,
+    comment_cache: HashMap<CommentCacheKey, CommentCacheEntry>,
     post_rows: HashMap<String, PostRowData>,
     post_rows_width: usize,
     pending_post_rows: Option<PendingPostRows>,
@@ -2378,6 +2415,8 @@ pub struct Model {
     subreddit_service: Option<Arc<dyn SubredditService + Send + Sync>>,
     comment_service: Option<Arc<dyn CommentService + Send + Sync>>,
     sort: reddit::SortOption,
+    comment_sort: reddit::CommentSortOption,
+    comment_sort_selected: bool,
     focused_pane: Pane,
     menu_visible: bool,
     menu_screen: MenuScreen,
@@ -2784,6 +2823,7 @@ impl Model {
         self.comment_offset.set(0);
         self.selected_comment = 0;
         self.comment_status = "Select a post to load comments.".to_string();
+        self.comment_sort_selected = false;
 
         self.selected_post = 0;
 
@@ -2813,7 +2853,10 @@ impl Model {
         self.ensure_subreddit_visible();
     }
 
-    fn scoped_comment_cache_mut(&mut self, key: &str) -> Option<&mut CommentCacheEntry> {
+    fn scoped_comment_cache_mut(
+        &mut self,
+        key: &CommentCacheKey,
+    ) -> Option<&mut CommentCacheEntry> {
         if let Some(entry) = self.comment_cache.get(key) {
             if entry.scope != self.cache_scope {
                 self.comment_cache.remove(key);
@@ -3039,6 +3082,8 @@ impl Model {
             subreddit_service: opts.subreddit_service.clone(),
             comment_service: opts.comment_service.clone(),
             sort: opts.default_sort,
+            comment_sort: opts.default_comment_sort,
+            comment_sort_selected: false,
             focused_pane: Pane::Posts,
             menu_visible: false,
             menu_screen: MenuScreen::Accounts,
@@ -3291,6 +3336,27 @@ impl Model {
                 self.reload_subreddits()?;
                 dirty = true;
             }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                if self.focused_pane == Pane::Comments {
+                    if self.posts.get(self.selected_post).is_some()
+                        && self.comment_service.is_some()
+                        && !self.banner_selected()
+                    {
+                        self.comment_sort_selected = true;
+                        self.status_message = format!(
+                            "Comment sort selected ({}). Use ←/→ or 1-{} to change; j/k returns to comments.",
+                            comment_sort_label(self.comment_sort),
+                            COMMENT_SORTS.len()
+                        );
+                        self.mark_dirty();
+                        return Ok(false);
+                    } else {
+                        self.status_message =
+                            "Load a post with comments before adjusting the sort.".to_string();
+                        dirty = true;
+                    }
+                }
+            }
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 self.open_action_menu();
                 return Ok(false);
@@ -3370,6 +3436,9 @@ impl Model {
                 {
                     self.shift_sort(-1)?;
                     dirty = true;
+                } else if self.focused_pane == Pane::Comments && self.comment_sort_selected {
+                    self.shift_comment_sort(-1)?;
+                    dirty = true;
                 } else {
                     let previous = self.focused_pane.previous();
                     if previous != self.focused_pane {
@@ -3387,6 +3456,9 @@ impl Model {
                 {
                     self.shift_sort(1)?;
                     dirty = true;
+                } else if self.focused_pane == Pane::Comments && self.comment_sort_selected {
+                    self.shift_comment_sort(1)?;
+                    dirty = true;
                 } else {
                     let next = self.focused_pane.next();
                     if next != self.focused_pane {
@@ -3399,12 +3471,17 @@ impl Model {
                     }
                 }
             }
-            KeyCode::Char(ch @ '1'..='5')
-                if self.focused_pane == Pane::Navigation
-                    && matches!(self.nav_mode, NavMode::Sorts) =>
+            KeyCode::Char(ch @ '1'..='6')
+                if (self.focused_pane == Pane::Navigation
+                    && matches!(self.nav_mode, NavMode::Sorts))
+                    || (self.focused_pane == Pane::Comments && self.comment_sort_selected) =>
             {
                 let idx = (ch as u8 - b'1') as usize;
-                self.set_sort_by_index(idx)?;
+                if self.focused_pane == Pane::Navigation {
+                    self.set_sort_by_index(idx)?;
+                } else {
+                    self.set_comment_sort_by_index(idx)?;
+                }
                 dirty = true;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -5104,6 +5181,7 @@ impl Model {
             AsyncResponse::Comments {
                 request_id,
                 post_name,
+                sort,
                 result,
             } => {
                 let Some(pending) = &self.pending_comments else {
@@ -5112,6 +5190,7 @@ impl Model {
                 if pending.cancel_flag.load(Ordering::SeqCst)
                     || pending.request_id != request_id
                     || pending.post_name != post_name
+                    || pending.sort != sort
                 {
                     return;
                 }
@@ -5119,14 +5198,14 @@ impl Model {
                     .posts
                     .get(self.selected_post)
                     .map(|post| post.post.name.as_str());
-                if current_name != Some(post_name.as_str()) {
+                if current_name != Some(post_name.as_str()) || self.comment_sort != sort {
                     return;
                 }
                 self.pending_comments = None;
 
                 match result {
                     Ok(comments) => {
-                        self.cache_comments(&post_name, comments.clone());
+                        self.cache_comments(&post_name, sort, comments.clone());
                         self.comments = comments;
                         self.collapsed_comments.clear();
                         self.selected_comment = 0;
@@ -5499,7 +5578,8 @@ impl Model {
                                 .get(self.selected_post)
                                 .map(|post| post.post.name.clone())
                             {
-                                if let Some(cache) = self.scoped_comment_cache_mut(&post_name) {
+                                let key = CommentCacheKey::new(&post_name, self.comment_sort);
+                                if let Some(cache) = self.scoped_comment_cache_mut(&key) {
                                     if let Some(entry) = cache.comments.get_mut(index) {
                                         entry.score = score;
                                         entry.likes = likes;
@@ -5583,12 +5663,29 @@ impl Model {
                 }
             }
             Pane::Comments => {
+                if self.comment_sort_selected {
+                    if delta > 0 {
+                        self.comment_sort_selected = false;
+                        self.mark_dirty();
+                    }
+                    return Ok(());
+                }
                 if self.visible_comment_indices.is_empty() {
                     return Ok(());
                 }
                 let len = self.visible_comment_indices.len() as i32;
                 let current = self.selected_comment as i32;
                 let next = (current + delta).clamp(0, len.saturating_sub(1));
+                if next == current && delta < 0 && current == 0 {
+                    self.comment_sort_selected = true;
+                    self.status_message = format!(
+                        "Comment sort selected ({}). Use ←/→ or 1-{} to change; j/k returns to comments.",
+                        comment_sort_label(self.comment_sort),
+                        COMMENT_SORTS.len()
+                    );
+                    self.mark_dirty();
+                    return Ok(());
+                }
                 if next != current {
                     self.selected_comment = next as usize;
                     self.ensure_comment_visible();
@@ -5724,7 +5821,8 @@ impl Model {
                 .get(self.selected_post)
                 .map(|post| post.post.name.clone())
             {
-                if let Some(cache) = self.scoped_comment_cache_mut(&post_name) {
+                let key = CommentCacheKey::new(&post_name, self.comment_sort);
+                if let Some(cache) = self.scoped_comment_cache_mut(&key) {
                     if let Some(entry) = cache.comments.get_mut(comment_index) {
                         entry.score = score;
                         entry.likes = likes;
@@ -5812,19 +5910,23 @@ impl Model {
     }
 
     fn recompute_comment_status(&mut self) {
+        let sort_display = comment_sort_label(self.comment_sort);
+
         if self.comments.is_empty() {
-            self.comment_status = "No comments yet.".to_string();
+            self.comment_status = format!("No comments yet · sorted by {}", sort_display);
             return;
         }
 
         let total = self.comments.len();
         let visible = self.visible_comment_indices.len();
         if visible == total {
-            self.comment_status = format!("{total} comments loaded");
+            self.comment_status = format!("{total} comments loaded · sorted by {}", sort_display);
         } else {
             let hidden = total.saturating_sub(visible);
-            self.comment_status =
-                format!("{total} comments loaded · {visible} visible · {hidden} hidden",);
+            self.comment_status = format!(
+                "{total} comments loaded · {visible} visible · {hidden} hidden · sorted by {}",
+                sort_display
+            );
         }
     }
 
@@ -5893,6 +5995,7 @@ impl Model {
             self.queue_active_kitty_delete();
             self.comment_offset.set(0);
             self.close_action_menu(None);
+            self.comment_sort_selected = false;
             self.sync_content_from_selection();
             if let Err(err) = self.load_comments_for_selection() {
                 self.comment_status = format!("Failed to load comments: {err}");
@@ -6293,6 +6396,41 @@ impl Model {
         self.set_sort_by_index(next as usize)
     }
 
+    fn comment_sort_index(&self) -> usize {
+        COMMENT_SORTS
+            .iter()
+            .position(|candidate| *candidate == self.comment_sort)
+            .unwrap_or(0)
+    }
+
+    fn set_comment_sort_by_index(&mut self, index: usize) -> Result<()> {
+        if index >= COMMENT_SORTS.len() {
+            return Ok(());
+        }
+        let sort = COMMENT_SORTS[index];
+        if self.comment_sort != sort {
+            self.comment_sort = sort;
+            self.status_message = format!("Comments sorted by {}", comment_sort_label(sort));
+            self.load_comments_for_selection()?;
+            self.comment_sort_selected = true;
+        } else {
+            self.status_message =
+                format!("Comments already sorted by {}", comment_sort_label(sort));
+        }
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn shift_comment_sort(&mut self, delta: i32) -> Result<()> {
+        let len = COMMENT_SORTS.len() as i32;
+        if len == 0 {
+            return Ok(());
+        }
+        let current = self.comment_sort_index() as i32;
+        let next = (current + delta).rem_euclid(len);
+        self.set_comment_sort_by_index(next as usize)
+    }
+
     fn cache_posts(&mut self, key: FeedCacheKey, batch: PostBatch) {
         if self.feed_cache.len() >= FEED_CACHE_MAX {
             if let Some(old_key) = self
@@ -6314,7 +6452,12 @@ impl Model {
         );
     }
 
-    fn cache_comments(&mut self, post_name: &str, comments: Vec<CommentEntry>) {
+    fn cache_comments(
+        &mut self,
+        post_name: &str,
+        sort: reddit::CommentSortOption,
+        comments: Vec<CommentEntry>,
+    ) {
         if self.comment_cache.len() >= COMMENT_CACHE_MAX {
             if let Some(old_key) = self
                 .comment_cache
@@ -6325,8 +6468,9 @@ impl Model {
                 self.comment_cache.remove(&old_key);
             }
         }
+        let key = CommentCacheKey::new(post_name, sort);
         self.comment_cache.insert(
-            post_name.to_string(),
+            key,
             CommentCacheEntry {
                 comments,
                 fetched_at: Instant::now(),
@@ -6444,8 +6588,11 @@ impl Model {
                     }
                     keep
                 });
-                self.comment_cache
-                    .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
+                self.comment_cache.retain(|key, _| {
+                    self.posts
+                        .iter()
+                        .any(|post| post.post.name == key.post_name)
+                });
                 self.content_cache
                     .retain(|key, _| self.posts.iter().any(|post| post.post.name == *key));
                 self.post_rows
@@ -6458,7 +6605,10 @@ impl Model {
                 self.selected_post = 0;
                 self.sync_content_from_selection();
                 self.selected_comment = 0;
-                self.comment_status = "Loading comments...".to_string();
+                self.comment_status = format!(
+                    "Loading comments... · sorted by {}",
+                    comment_sort_label(self.comment_sort)
+                );
                 self.comments.clear();
                 self.collapsed_comments.clear();
                 self.visible_comment_indices.clear();
@@ -6949,6 +7099,7 @@ impl Model {
 
     fn load_comments_for_selection(&mut self) -> Result<()> {
         self.ensure_cache_scope();
+        self.comment_sort_selected = false;
         let Some(service) = self.comment_service.clone() else {
             self.comments.clear();
             self.collapsed_comments.clear();
@@ -6974,7 +7125,8 @@ impl Model {
         let key = post.post.name.clone();
         let subreddit = post.post.subreddit.clone();
         let article = post.post.id.clone();
-        if let Some(entry) = self.comment_cache.get(&key) {
+        let cache_key = CommentCacheKey::new(&key, self.comment_sort);
+        if let Some(entry) = self.comment_cache.get(&cache_key) {
             if entry.scope == self.cache_scope && entry.fetched_at.elapsed() < COMMENT_CACHE_TTL {
                 self.comments = entry.comments.clone();
                 self.collapsed_comments.clear();
@@ -6982,16 +7134,23 @@ impl Model {
                 self.comment_offset.set(0);
                 self.rebuild_visible_comments_reset();
                 if self.comments.is_empty() {
-                    self.comment_status = "No comments yet. (cached)".to_string();
+                    self.comment_status = format!(
+                        "No comments yet. (cached · sorted by {})",
+                        comment_sort_label(self.comment_sort)
+                    );
                 } else {
                     let total = self.comments.len();
                     let visible = self.visible_comment_indices.len();
                     if visible == total {
-                        self.comment_status = format!("{total} comments loaded (cached)");
+                        self.comment_status = format!(
+                            "{total} comments loaded (cached · sorted by {})",
+                            comment_sort_label(self.comment_sort)
+                        );
                     } else {
                         let hidden = total.saturating_sub(visible);
                         self.comment_status = format!(
-                            "{total} comments loaded (cached) · {visible} visible · {hidden} hidden",
+                            "{total} comments loaded (cached · sorted by {}) · {visible} visible · {hidden} hidden",
+                            comment_sort_label(self.comment_sort)
                         );
                     }
                 }
@@ -7008,14 +7167,19 @@ impl Model {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let post_name = key.clone();
+        let sort = self.comment_sort;
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.pending_comments = Some(PendingComments {
             request_id,
             post_name: post_name.clone(),
             cancel_flag: cancel_flag.clone(),
+            sort,
         });
-        self.comment_status = "Loading comments...".to_string();
+        self.comment_status = format!(
+            "Loading comments... · sorted by {}",
+            comment_sort_label(sort)
+        );
         self.comments.clear();
         self.collapsed_comments.clear();
         self.visible_comment_indices.clear();
@@ -7029,17 +7193,20 @@ impl Model {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
-            let result = service.load_comments(&subreddit, &article).map(|listing| {
-                let mut entries = Vec::new();
-                collect_comments(&listing.comments, 0, &mut entries);
-                entries
-            });
+            let result = service
+                .load_comments(&subreddit, &article, sort)
+                .map(|listing| {
+                    let mut entries = Vec::new();
+                    collect_comments(&listing.comments, 0, &mut entries);
+                    entries
+                });
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
             let _ = tx.send(AsyncResponse::Comments {
                 request_id,
                 post_name,
+                sort,
                 result,
             });
         });
@@ -7339,6 +7506,68 @@ impl Model {
         )]));
         output.extend(lines.into_iter().map(Line::from));
         output
+    }
+
+    fn comment_sort_lines_for_width(&self, width: usize, focused: bool) -> Vec<Line<'static>> {
+        let mut entries: Vec<(String, Style, usize)> = Vec::with_capacity(COMMENT_SORTS.len());
+        for (idx, sort) in COMMENT_SORTS.iter().enumerate() {
+            let is_active = self.comment_sort == *sort;
+            let marker = if is_active { "●" } else { "○" };
+            let mut style = if is_active {
+                if focused {
+                    Style::default()
+                        .bg(COLOR_PANEL_SELECTED_BG)
+                        .fg(COLOR_TEXT_PRIMARY)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else if focused {
+                Style::default()
+                    .bg(COLOR_PANEL_SELECTED_BG)
+                    .fg(COLOR_TEXT_PRIMARY)
+            } else {
+                Style::default().fg(COLOR_TEXT_SECONDARY)
+            };
+            if !focused {
+                style = style.bg(COLOR_PANEL_BG);
+            }
+            let number = idx + 1;
+            let label = format!("{number} {marker} {}", comment_sort_label(*sort));
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            entries.push((label, style, label_width));
+        }
+
+        let available_width = width.max(1);
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        let mut current_line: Vec<Span> = Vec::new();
+        let mut current_width = 0usize;
+
+        for (label, style, label_width) in entries.into_iter() {
+            let spacing_width = if current_line.is_empty() { 0 } else { 3 };
+            if !current_line.is_empty()
+                && current_width + spacing_width + label_width > available_width
+            {
+                lines.push(current_line);
+                current_line = Vec::new();
+                current_width = 0;
+            }
+            if !current_line.is_empty() {
+                current_line.push(Span::raw("   "));
+                current_width += spacing_width;
+            }
+            current_line.push(Span::styled(label, style));
+            current_width += label_width;
+        }
+
+        if current_line.is_empty() {
+            current_line.push(Span::raw(""));
+        }
+        lines.push(current_line);
+
+        lines.into_iter().map(Line::from).collect()
     }
 
     fn draw_subreddits(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -7837,12 +8066,34 @@ impl Model {
     fn draw_comments(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = self.pane_block(Pane::Comments);
         let inner = block.inner(area);
-        let width = inner.width.max(1) as usize;
-        let focused = self.focused_pane == Pane::Comments;
-        self.comment_view_height.set(inner.height);
-        self.comment_view_width.set(inner.width);
-        let total_visible = self.visible_comment_indices.len();
+        frame.render_widget(block, area);
 
+        let focused = self.focused_pane == Pane::Comments;
+        let sort_focused = focused && self.comment_sort_selected;
+        let sort_lines = self.comment_sort_lines_for_width(inner.width as usize, sort_focused);
+        let sort_height = sort_lines.len().max(1) as u16;
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(sort_height), Constraint::Min(1)])
+            .split(inner);
+
+        let sort_paragraph =
+            Paragraph::new(sort_lines)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().bg(if sort_focused {
+                    COLOR_PANEL_SELECTED_BG
+                } else {
+                    COLOR_PANEL_BG
+                }));
+        frame.render_widget(sort_paragraph, layout[0]);
+
+        let comment_area = layout[1];
+        let width = comment_area.width.max(1) as usize;
+        self.comment_view_height.set(comment_area.height);
+        self.comment_view_width.set(comment_area.width);
+
+        let total_visible = self.visible_comment_indices.len();
         let comment_status = if self.pending_comments.is_some() {
             format!("{} {}", self.spinner.frame(), self.comment_status)
                 .trim()
@@ -7856,7 +8107,7 @@ impl Model {
             .add_modifier(Modifier::BOLD);
         let mut status_lines = wrap_plain(&comment_status, width, status_style);
         status_lines.push(Line::from(Span::styled(String::new(), status_style)));
-        pad_lines_to_width(&mut status_lines, inner.width);
+        pad_lines_to_width(&mut status_lines, comment_area.width);
         self.comment_status_height.set(status_lines.len());
         self.ensure_comment_visible();
         let offset = self.comment_offset.get().min(total_visible);
@@ -7872,7 +8123,7 @@ impl Model {
                 Some(entry) => entry,
                 None => continue,
             };
-            let selected = visible_idx == self.selected_comment;
+            let selected = visible_idx == self.selected_comment && !self.comment_sort_selected;
             let highlight = focused && selected;
             let background = if highlight {
                 COLOR_PANEL_SELECTED_BG
@@ -7909,7 +8160,7 @@ impl Model {
                 break;
             }
             lines.push(Line::from(Span::styled(String::new(), body_style)));
-            pad_lines_to_width(&mut lines, inner.width);
+            pad_lines_to_width(&mut lines, comment_area.width);
             items.push(ListItem::new(lines));
             if available_height == 0 {
                 break;
@@ -7922,8 +8173,8 @@ impl Model {
             }
         }
 
-        let list = List::new(items).block(block);
-        frame.render_widget(list, area);
+        let list = List::new(items);
+        frame.render_widget(list, comment_area);
     }
 
     fn draw_menu(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -8437,7 +8688,7 @@ impl Model {
         }
 
         let mut parts: Vec<String> = Vec::new();
-        parts.push("Links menu (o)".to_string());
+        parts.push("Actions menu (o)".to_string());
 
         match self.focused_pane {
             Pane::Navigation => match self.nav_mode {
@@ -8477,6 +8728,7 @@ impl Model {
                 } else {
                     parts.push("Comments: j/k move, c fold, Shift+C expand".to_string());
                     parts.push("Votes: u upvote, d downvote".to_string());
+                    parts.push("Sort: t or ↑ at top; ←/→ cycle".to_string());
                 }
             }
         }

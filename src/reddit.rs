@@ -79,6 +79,31 @@ impl SortOption {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentSortOption {
+    #[default]
+    Confidence,
+    Top,
+    New,
+    Controversial,
+    Old,
+    Qa,
+}
+
+impl CommentSortOption {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CommentSortOption::Confidence => "confidence",
+            CommentSortOption::Top => "top",
+            CommentSortOption::New => "new",
+            CommentSortOption::Controversial => "controversial",
+            CommentSortOption::Old => "old",
+            CommentSortOption::Qa => "qa",
+        }
+    }
+}
+
 fn sanitize_username(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -196,6 +221,7 @@ impl Client {
         &self,
         subreddit: &str,
         article: &str,
+        sort: CommentSortOption,
         opts: ListingOptions,
     ) -> Result<PostComments> {
         let base = subreddit.trim_start_matches("r/");
@@ -204,7 +230,8 @@ impl Client {
         } else {
             format!("/r/{}/comments/{}.json", base, article)
         };
-        let params = opts.into_params();
+        let mut params = opts.into_params();
+        params.push(("sort".into(), sort.as_str().to_string()));
         let resp = self.request(Method::GET, &path, &params, None)?;
         let payload: Vec<Value> = resp.json()?;
         if payload.len() < 2 {

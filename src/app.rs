@@ -144,6 +144,7 @@ pub fn run() -> Result<()> {
         feed_service,
         subreddit_service,
         default_sort: reddit::SortOption::Hot,
+        default_comment_sort: reddit::CommentSortOption::Confidence,
         comment_service,
         interaction_service,
         media_handle,

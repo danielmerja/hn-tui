@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
 use std::sync::Arc;
 
-use crate::reddit::{self, ListingOptions, SortOption};
+use crate::reddit::{self, CommentSortOption, ListingOptions, SortOption};
 
 pub trait SubredditService: Send + Sync {
     fn list_subreddits(&self, source: reddit::SubredditSource) -> Result<Vec<reddit::Subreddit>>;
@@ -35,7 +35,12 @@ pub trait FeedService: Send + Sync {
 }
 
 pub trait CommentService: Send + Sync {
-    fn load_comments(&self, subreddit: &str, article: &str) -> Result<reddit::PostComments>;
+    fn load_comments(
+        &self,
+        subreddit: &str,
+        article: &str,
+        sort: CommentSortOption,
+    ) -> Result<reddit::PostComments>;
 }
 
 pub trait InteractionService: Send + Sync {
@@ -139,9 +144,14 @@ impl RedditCommentService {
 }
 
 impl CommentService for RedditCommentService {
-    fn load_comments(&self, subreddit: &str, article: &str) -> Result<reddit::PostComments> {
+    fn load_comments(
+        &self,
+        subreddit: &str,
+        article: &str,
+        sort: CommentSortOption,
+    ) -> Result<reddit::PostComments> {
         self.client
-            .comments(subreddit, article, ListingOptions::default())
+            .comments(subreddit, article, sort, ListingOptions::default())
             .context("fetch comments")
     }
 }
@@ -258,7 +268,12 @@ impl FeedService for MockFeedService {
 pub struct MockCommentService;
 
 impl CommentService for MockCommentService {
-    fn load_comments(&self, subreddit: &str, article: &str) -> Result<reddit::PostComments> {
+    fn load_comments(
+        &self,
+        subreddit: &str,
+        article: &str,
+        _sort: CommentSortOption,
+    ) -> Result<reddit::PostComments> {
         Ok(reddit::PostComments {
             post: reddit::Post {
                 id: article.into(),
