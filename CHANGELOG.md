@@ -5,8 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Nothing yet.
+
+## [0.1.16] - 2025-10-08
 ### Added
-- Clipboard shortcut (`y`) copies the highlighted comment using a persistent system clipboard session for Wayland/X11 setups.
+- Clipboard shortcut (`y`) copies the highlighted comment to the system clipboard.
 
 ## [0.1.15] - 2025-10-08
 ### Added
@@ -85,7 +88,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/ck-zhang/reddix/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/ck-zhang/reddix/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/ck-zhang/reddix/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/ck-zhang/reddix/compare/v0.1.12...v0.1.13
