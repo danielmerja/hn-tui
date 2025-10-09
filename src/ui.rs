@@ -237,6 +237,25 @@ enum ActionMenuAction {
     OpenNavigation,
 }
 
+#[derive(Clone)]
+struct HelpSection {
+    title: String,
+    entries: Vec<(String, String)>,
+}
+
+impl HelpSection {
+    fn new(title: impl Into<String>, entries: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+        let converted = entries
+            .into_iter()
+            .map(|(binding, description)| (binding.into(), description.into()))
+            .collect();
+        Self {
+            title: title.into(),
+            entries: converted,
+        }
+    }
+}
+
 impl NavigationMatch {
     fn new(label: impl Into<String>, target: NavigationTarget) -> Self {
         Self {
@@ -2453,6 +2472,7 @@ pub struct Model {
     menu_accounts: Vec<MenuAccountEntry>,
     menu_account_index: usize,
     action_menu_visible: bool,
+    help_visible: bool,
     action_menu_mode: ActionMenuMode,
     action_menu_items: Vec<ActionMenuEntry>,
     action_menu_selected: usize,
@@ -3121,6 +3141,7 @@ impl Model {
             menu_accounts: Vec::new(),
             menu_account_index: 0,
             action_menu_visible: false,
+            help_visible: false,
             action_menu_mode: ActionMenuMode::Root,
             action_menu_items: Vec::new(),
             action_menu_selected: 0,
@@ -3343,6 +3364,10 @@ impl Model {
             return self.handle_action_menu_key(key);
         }
 
+        if self.help_visible {
+            return self.handle_help_key(key);
+        }
+
         let mut dirty = false;
 
         if !matches!(code, KeyCode::Char(ch) if ch.is_ascii_digit()) {
@@ -3354,6 +3379,10 @@ impl Model {
             KeyCode::Char('m') | KeyCode::Char('M') => {
                 self.open_menu()?;
                 dirty = true;
+            }
+            KeyCode::Char('?') => {
+                self.open_help();
+                return Ok(false);
             }
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 self.open_navigation_mode(String::new(), true);
@@ -3637,7 +3666,7 @@ impl Model {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Result<()> {
-        if self.menu_visible || self.action_menu_visible {
+        if self.menu_visible || self.action_menu_visible || self.help_visible {
             return Ok(());
         }
 
@@ -4001,6 +4030,23 @@ impl Model {
             if let Some(msg) = message {
                 self.status_message = msg.to_string();
             }
+            self.mark_dirty();
+        }
+    }
+
+    fn open_help(&mut self) {
+        if self.help_visible {
+            return;
+        }
+        self.help_visible = true;
+        self.status_message = "Help: press Esc or ? to close".to_string();
+        self.mark_dirty();
+    }
+
+    fn close_help(&mut self) {
+        if self.help_visible {
+            self.help_visible = false;
+            self.status_message = "Help closed.".to_string();
             self.mark_dirty();
         }
     }
@@ -4577,6 +4623,16 @@ impl Model {
         Ok(false)
     }
 
+    fn handle_help_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                self.close_help();
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn draw_action_menu(&self, frame: &mut Frame<'_>, area: Rect) {
         match &self.action_menu_mode {
             ActionMenuMode::Root => self.draw_action_menu_root(frame, area),
@@ -4585,6 +4641,68 @@ impl Model {
                 self.draw_action_menu_navigation(frame, area, state)
             }
         }
+    }
+
+    fn draw_help_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let popup_area = centered_rect(80, 80, area);
+        frame.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .title(Span::styled(
+                "Help",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLOR_ACCENT))
+            .style(Style::default().bg(COLOR_PANEL_BG))
+            .padding(Padding::new(2, 2, 1, 1));
+
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+
+        let sections = self.help_sections();
+        let split_at = sections.len().div_ceil(2);
+        let (left_sections, right_sections) = sections.split_at(split_at);
+
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(vertical[0]);
+
+        let left_text = Self::help_column_text(left_sections);
+        frame.render_widget(
+            Paragraph::new(left_text)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(COLOR_TEXT_PRIMARY).bg(COLOR_PANEL_BG)),
+            columns[0],
+        );
+
+        if !right_sections.is_empty() {
+            let right_text = Self::help_column_text(right_sections);
+            frame.render_widget(
+                Paragraph::new(right_text)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(COLOR_TEXT_PRIMARY).bg(COLOR_PANEL_BG)),
+                columns[1],
+            );
+        }
+
+        let footer = Paragraph::new("Press Esc or ? to close this overlay.")
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .bg(COLOR_PANEL_BG)
+                    .add_modifier(Modifier::ITALIC),
+            );
+        frame.render_widget(footer, vertical[1]);
     }
 
     fn draw_action_menu_root(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -4900,6 +5018,90 @@ impl Model {
                 .add_modifier(Modifier::ITALIC),
         );
         frame.render_widget(instructions, layout[2]);
+    }
+
+    fn help_sections(&self) -> Vec<HelpSection> {
+        let sections = vec![
+            HelpSection::new(
+                "Move around",
+                vec![
+                    ("h / l", "Focus the pane to the left or right"),
+                    ("j / k", "Step through lists and menus"),
+                    ("Ctrl+H/J/K/L", "Steer overlays even when typing"),
+                    ("↑ / ↓", "Scroll within long views"),
+                    ("Page↑ / Page↓ / Space", "Jump by a larger chunk"),
+                ],
+            ),
+            HelpSection::new(
+                "Open & switch",
+                vec![
+                    ("Enter", "Activate whatever is highlighted"),
+                    ("o", "Open the actions menu"),
+                    ("g", "Open the navigation palette"),
+                    ("?", "Toggle this help overlay"),
+                    ("m", "Open the guided setup menu"),
+                    ("h / Esc", "Back out of menus"),
+                ],
+            ),
+            HelpSection::new(
+                "Refresh & sort",
+                vec![
+                    ("r", "Reload the current feed"),
+                    ("s", "Refresh subscribed lists"),
+                    ("t", "Focus comment sort controls"),
+                    ("digits", "Jump directly to a post number"),
+                ],
+            ),
+            HelpSection::new(
+                "Vote & expand",
+                vec![
+                    ("u / d", "Upvote or downvote the selection"),
+                    ("c", "Collapse or expand a comment thread"),
+                    ("Shift+C", "Expand the comment thread fully"),
+                ],
+            ),
+            HelpSection::new(
+                "Extras",
+                vec![
+                    ("y", "Copy the highlighted comment"),
+                    ("U", "Run the available updater"),
+                    ("q / Esc", "Quit Reddix"),
+                ],
+            ),
+        ];
+
+        sections
+    }
+
+    fn help_column_text(sections: &[HelpSection]) -> Text<'static> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        for (index, section) in sections.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(vec![Span::styled(
+                section.title.clone(),
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::default());
+
+            for (binding, description) in &section.entries {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<18}", binding),
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(description.clone()),
+                ]));
+            }
+        }
+
+        Text::from(lines)
     }
 
     fn open_support_link(&mut self) -> Result<()> {
@@ -7356,12 +7558,16 @@ impl Model {
         if self.action_menu_visible {
             self.draw_action_menu(frame, layout[1]);
         }
+
+        if self.help_visible {
+            self.draw_help_overlay(frame, layout[1]);
+        }
     }
 
     fn flush_inline_images(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
         self.flush_pending_kitty_deletes(backend)?;
 
-        if self.action_menu_visible || self.menu_visible {
+        if self.action_menu_visible || self.menu_visible || self.help_visible {
             self.needs_kitty_flush = true;
             self.emit_active_kitty_delete(backend)?;
             return Ok(());
@@ -8762,38 +8968,34 @@ impl Model {
             };
         }
 
+        if self.help_visible {
+            return "Help: Esc or ? to close".to_string();
+        }
+
+        if self.action_menu_visible {
+            return "Actions: j/k move · Enter/l open · h/Esc close".to_string();
+        }
+
         let mut parts: Vec<String> = Vec::new();
-        parts.push("Actions menu (o)".to_string());
 
         match self.focused_pane {
             Pane::Navigation => match self.nav_mode {
                 NavMode::Sorts => {
-                    parts.push("Sorts: ←/→ or 1-5 change order".to_string());
-                    parts.push("Enter reloads feed".to_string());
-                    if !self.subreddits.is_empty() {
-                        parts.push("Press j to jump to subscriptions".to_string());
-                    }
-                    parts.push("s refresh subscriptions".to_string());
+                    parts.push("Navigation: ←/→ sort · Enter load".to_string());
                 }
                 NavMode::Subreddits => {
-                    parts.push("Subreddits: j/k move, Enter load".to_string());
-                    parts.push("k on first returns to sorts".to_string());
-                    parts.push("s refresh subscriptions".to_string());
+                    parts.push("Subreddits: j/k move · Enter load".to_string());
                 }
             },
             Pane::Posts => {
                 if self.posts.is_empty() {
                     parts.push("Posts: waiting for feed…".to_string());
                 } else {
-                    parts.push("Posts: j/k move, digits jump, Space/Page scroll".to_string());
-                    parts.push("Votes: u upvote, d downvote".to_string());
+                    parts.push("Posts: j/k move · Enter open · h go to navigation".to_string());
                 }
             }
             Pane::Content => {
-                parts.push("Content: ↑/↓ scroll, PageUp/PageDown faster".to_string());
-                if !self.posts.is_empty() {
-                    parts.push("Votes: u upvote, d downvote".to_string());
-                }
+                parts.push("Content: ↑/↓ scroll".to_string());
             }
             Pane::Comments => {
                 if self.pending_comments.is_some() {
@@ -8801,10 +9003,7 @@ impl Model {
                 } else if self.comments.is_empty() {
                     parts.push("No comments yet".to_string());
                 } else {
-                    parts.push("Comments: j/k move, c fold, Shift+C expand".to_string());
-                    parts.push("Votes: u upvote, d downvote".to_string());
-                    parts.push("Sort: t or ↑ at top; ←/→ cycle".to_string());
-                    parts.push("Copy: y copy comment".to_string());
+                    parts.push("Comments: j/k move · ←/→ sort · y copy".to_string());
                 }
             }
         }
@@ -8813,7 +9012,9 @@ impl Model {
             parts.push("Refreshing feed…".to_string());
         }
 
-        parts.push("r refresh posts".to_string());
+        parts.push("h/l focus panes".to_string());
+        parts.push("o actions menu".to_string());
+        parts.push("? help".to_string());
         parts.push("m guided menu".to_string());
         parts.push("q quit".to_string());
 
