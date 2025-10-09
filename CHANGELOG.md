@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.17] - 2025-10-09
+### Added
+- `?` help overlay with grouped keybindings and contextual sections.
+### Changed
+- Footer now shows only essential shortcuts and highlights `h/l` pane focus hints.
+- Help overlay copy now highlights general navigation heuristics (hjkl and Ctrl+H/J/K/L).
+
 ## [0.1.16] - 2025-10-08
 ### Added
 - Clipboard shortcut (`y`) copies the highlighted comment to the system clipboard.
@@ -88,7 +95,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/ck-zhang/reddix/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/ck-zhang/reddix/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/ck-zhang/reddix/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/ck-zhang/reddix/compare/v0.1.13...v0.1.14
