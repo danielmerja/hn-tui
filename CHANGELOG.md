@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.21] - 2025-10-10
+### Fixed
+- Retrieved the full subscription list by paging Reddit's API so the navigation pane shows every subreddit again.
+
 ## [0.1.20] - 2025-10-10
 ### Added
 - Fullscreen media toggle (`f`) that refetches inline previews at terminal size and centers them on screen.
@@ -108,7 +112,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/ck-zhang/reddix/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/ck-zhang/reddix/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/ck-zhang/reddix/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/ck-zhang/reddix/compare/v0.1.17...v0.1.18
