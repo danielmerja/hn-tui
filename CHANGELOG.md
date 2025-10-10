@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.20] - 2025-10-10
+### Added
+- Fullscreen media toggle (`f`) that refetches inline previews at terminal size and centers them on screen.
+
 ## [0.1.19] - 2025-10-10
 ### Changed
 - Always emit Kitty inline media previews so supported terminals render images instantly while others simply show empty space.
@@ -104,7 +108,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/ck-zhang/reddix/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/ck-zhang/reddix/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/ck-zhang/reddix/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/ck-zhang/reddix/compare/v0.1.16...v0.1.17
