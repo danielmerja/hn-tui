@@ -59,6 +59,8 @@ use crate::update::{self, SKIP_UPDATE_ENV};
 
 const MAX_IMAGE_COLS: i32 = 40;
 const MAX_IMAGE_ROWS: i32 = 20;
+const MIN_IMAGE_COLS: i32 = 12;
+const MIN_IMAGE_ROWS: i32 = 6;
 const TARGET_PREVIEW_WIDTH_PX: i64 = 480;
 const KITTY_CHUNK_SIZE: usize = 4096;
 const MEDIA_INDENT: u16 = 0;
@@ -388,6 +390,10 @@ impl ActionMenuEntry {
 struct MediaPreview {
     placeholder: Text<'static>,
     kitty: Option<KittyImage>,
+    cols: i32,
+    rows: i32,
+    limited_cols: bool,
+    limited_rows: bool,
 }
 
 impl MediaPreview {
@@ -401,6 +407,18 @@ impl MediaPreview {
 
     fn has_kitty(&self) -> bool {
         self.kitty.is_some()
+    }
+
+    fn dims(&self) -> (i32, i32) {
+        (self.cols, self.rows)
+    }
+
+    fn limited_cols(&self) -> bool {
+        self.limited_cols
+    }
+
+    fn limited_rows(&self) -> bool {
+        self.limited_rows
     }
 }
 
@@ -457,6 +475,12 @@ impl KittyImage {
 struct MediaLayout {
     line_offset: usize,
     indent: u16,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MediaConstraints {
+    cols: i32,
+    rows: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -1416,6 +1440,8 @@ fn load_media_preview(
     post: &reddit::Post,
     cancel_flag: &AtomicBool,
     media_handle: Option<media::Handle>,
+    max_cols: i32,
+    max_rows: i32,
 ) -> Result<Option<MediaPreview>> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -1441,6 +1467,10 @@ fn load_media_preview(
         return Ok(Some(MediaPreview {
             placeholder: text_from_string(fallback),
             kitty: None,
+            cols: 0,
+            rows: 0,
+            limited_cols: false,
+            limited_rows: false,
         }));
     }
 
@@ -1452,6 +1482,10 @@ fn load_media_preview(
         return Ok(Some(MediaPreview {
             placeholder: text_from_string(fallback),
             kitty: None,
+            cols: 0,
+            rows: 0,
+            limited_cols: false,
+            limited_rows: false,
         }));
     }
 
@@ -1476,9 +1510,28 @@ fn load_media_preview(
         bail!("preview image empty");
     }
 
-    let (cols, rows) =
-        clamp_dimensions(source.width, source.height, MAX_IMAGE_COLS, MAX_IMAGE_ROWS);
+    let capped_cols = max_cols.clamp(1, MAX_IMAGE_COLS);
+    let capped_rows = max_rows.clamp(1, MAX_IMAGE_ROWS);
+    let (cols, rows) = clamp_dimensions(source.width, source.height, capped_cols, capped_rows);
     let label = image_label(&url);
+    let limited_cols = max_cols < MAX_IMAGE_COLS && cols >= max_cols;
+    let limited_rows = max_rows < MAX_IMAGE_ROWS && rows >= max_rows;
+
+    if cols < MIN_IMAGE_COLS || rows < MIN_IMAGE_ROWS {
+        let fallback = indent_media_preview(&format!(
+            "[preview omitted: viewport too small — {}]",
+            label
+        ));
+        return Ok(Some(MediaPreview {
+            placeholder: text_from_string(fallback),
+            kitty: None,
+            cols,
+            rows,
+            limited_cols,
+            limited_rows,
+        }));
+    }
+
     let kitty = kitty_transmit_inline(&bytes, cols, rows, kitty_image_id(&post.name, &url))?;
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -1487,6 +1540,10 @@ fn load_media_preview(
     Ok(Some(MediaPreview {
         placeholder,
         kitty: Some(kitty),
+        cols,
+        rows,
+        limited_cols,
+        limited_rows,
     }))
 }
 
@@ -2431,6 +2488,7 @@ pub struct Model {
     media_save_in_progress: Option<MediaSaveJob>,
     media_layouts: HashMap<String, MediaLayout>,
     media_handle: Option<media::Handle>,
+    media_constraints: MediaConstraints,
     feed_cache: HashMap<FeedCacheKey, FeedCacheEntry>,
     comment_cache: HashMap<CommentCacheKey, CommentCacheEntry>,
     post_rows: HashMap<String, PostRowData>,
@@ -3100,6 +3158,10 @@ impl Model {
             media_save_in_progress: None,
             media_layouts: HashMap::new(),
             media_handle: opts.media_handle.clone(),
+            media_constraints: MediaConstraints {
+                cols: MAX_IMAGE_COLS,
+                rows: MAX_IMAGE_ROWS,
+            },
             feed_cache: HashMap::new(),
             comment_cache: HashMap::new(),
             post_rows: HashMap::new(),
@@ -7335,6 +7397,21 @@ impl Model {
             return;
         }
 
+        let (max_cols, max_rows) = self.media_constraints();
+        self.request_media_preview_with_limits(post, max_cols, max_rows);
+    }
+
+    fn request_media_preview_with_limits(
+        &mut self,
+        post: &reddit::Post,
+        max_cols: i32,
+        max_rows: i32,
+    ) {
+        let key = post.name.clone();
+        if self.pending_media.contains_key(&key) {
+            return;
+        }
+
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.pending_media.insert(key.clone(), cancel_flag.clone());
         let tx = self.response_tx.clone();
@@ -7346,7 +7423,13 @@ impl Model {
                 return;
             }
             let name = post_clone.name.clone();
-            let result = load_media_preview(&post_clone, cancel_flag.as_ref(), media_handle);
+            let result = load_media_preview(
+                &post_clone,
+                cancel_flag.as_ref(),
+                media_handle,
+                max_cols,
+                max_rows,
+            );
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
@@ -7355,6 +7438,24 @@ impl Model {
                 result,
             });
         });
+    }
+
+    fn media_constraints(&self) -> (i32, i32) {
+        (self.media_constraints.cols, self.media_constraints.rows)
+    }
+
+    fn update_media_constraints(&mut self, area: Rect) -> bool {
+        let available_cols = area.width.saturating_sub(MEDIA_INDENT).max(1) as i32;
+        let available_rows = area.height.saturating_sub(1).max(1) as i32;
+        let cols = MAX_IMAGE_COLS.min(available_cols.max(1));
+        let rows = MAX_IMAGE_ROWS.min(available_rows.max(1));
+        let new_constraints = MediaConstraints { cols, rows };
+        if new_constraints != self.media_constraints {
+            self.media_constraints = new_constraints;
+            true
+        } else {
+            false
+        }
     }
 
     fn ensure_media_request_ready(&mut self, post: &PostPreview) {
@@ -8257,21 +8358,58 @@ impl Model {
         let key = post.post.name.clone();
         let mut lines = base.lines;
         self.media_layouts.remove(&key);
-        if let Some(preview) = self.media_previews.get(&key) {
-            if !lines.is_empty() && !line_is_blank(lines.last().unwrap()) {
-                lines.push(Line::raw(String::new()));
-            }
-            let offset = lines.len();
-            lines.extend(preview.placeholder().lines.clone());
-            self.media_layouts.insert(
-                key.clone(),
-                MediaLayout {
-                    line_offset: offset,
-                    indent: MEDIA_INDENT,
-                },
-            );
-            if preview.has_kitty() {
-                self.needs_kitty_flush = true;
+        let (max_cols, max_rows) = self.media_constraints();
+        if let Some(preview) = self.media_previews.get(&key).cloned() {
+            let (cols, rows) = preview.dims();
+            let needs_downscale = preview.has_kitty() && (cols > max_cols || rows > max_rows);
+            let limited_cols = preview.limited_cols();
+            let limited_rows = preview.limited_rows();
+            let expand_cols = limited_cols && max_cols > cols;
+            let expand_rows = limited_rows && max_rows > rows;
+            let can_expand = (expand_cols || expand_rows)
+                && max_cols >= MIN_IMAGE_COLS
+                && max_rows >= MIN_IMAGE_ROWS;
+
+            if needs_downscale || can_expand {
+                if let Some(flag) = self.pending_media.remove(&key) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                self.media_previews.remove(&key);
+                self.media_failures.remove(&key);
+                self.queue_active_kitty_delete();
+                self.request_media_preview_with_limits(&post.post, max_cols, max_rows);
+
+                if !lines.is_empty() && !line_is_blank(lines.last().unwrap()) {
+                    lines.push(Line::raw(String::new()));
+                }
+                let offset = lines.len();
+                lines.push(Line::from(Span::styled(
+                    "Loading preview...",
+                    Style::default().fg(COLOR_TEXT_SECONDARY),
+                )));
+                self.media_layouts.insert(
+                    key.clone(),
+                    MediaLayout {
+                        line_offset: offset,
+                        indent: MEDIA_INDENT,
+                    },
+                );
+            } else {
+                if !lines.is_empty() && !line_is_blank(lines.last().unwrap()) {
+                    lines.push(Line::raw(String::new()));
+                }
+                let offset = lines.len();
+                lines.extend(preview.placeholder().lines.clone());
+                self.media_layouts.insert(
+                    key.clone(),
+                    MediaLayout {
+                        line_offset: offset,
+                        indent: MEDIA_INDENT,
+                    },
+                );
+                if preview.has_kitty() {
+                    self.needs_kitty_flush = true;
+                }
             }
         } else if !self.media_failures.contains(&key) {
             let mut offset = lines.len();
@@ -8296,6 +8434,25 @@ impl Model {
             alignment: base.alignment,
             style: base.style,
         }
+    }
+
+    fn refresh_selected_post_media(&mut self) {
+        let Some(post) = self.posts.get(self.selected_post).cloned() else {
+            return;
+        };
+        let key = post.post.name.clone();
+        if let Some(rendered) = self.content_cache.get(&key).cloned() {
+            let scroll = self.content_scroll;
+            self.content = self.compose_content(rendered, &post);
+            let max_scroll = self
+                .content
+                .lines
+                .len()
+                .saturating_sub(1)
+                .min(u16::MAX as usize);
+            self.content_scroll = scroll.min(max_scroll as u16);
+        }
+        self.ensure_media_request_ready(&post);
     }
 
     fn queue_content_render(&mut self, post_name: String, source: String) {
@@ -8333,7 +8490,11 @@ impl Model {
     fn draw_content(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = self.pane_block(Pane::Content);
         let inner = block.inner(area);
+        let constraints_changed = self.update_media_constraints(inner);
         self.content_area = Some(inner);
+        if constraints_changed {
+            self.refresh_selected_post_media();
+        }
         if self.selected_post_has_kitty_preview() {
             self.needs_kitty_flush = true;
         }
