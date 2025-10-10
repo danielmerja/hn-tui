@@ -10,6 +10,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,6 +67,7 @@ const MIN_IMAGE_ROWS: i32 = 6;
 const TARGET_PREVIEW_WIDTH_PX: i64 = 480;
 const KITTY_CHUNK_SIZE: usize = 4096;
 const MEDIA_INDENT: u16 = 0;
+const KITTY_PROBE_TIMEOUT_MS: u64 = 150;
 
 // TODO video preview
 const COLOR_BG: Color = Color::Rgb(30, 30, 46);
@@ -994,6 +998,9 @@ enum AsyncResponse {
     UpdateInstall {
         result: Result<()>,
     },
+    KittyProbe {
+        result: Result<bool>,
+    },
     JoinStatus {
         account_id: i64,
         result: Result<bool>,
@@ -1462,21 +1469,6 @@ fn load_media_preview(
     if !is_supported_preview_url(&url) {
         let fallback = indent_media_preview(&format!(
             "[preview omitted: unsupported media — {}]",
-            image_label(&url)
-        ));
-        return Ok(Some(MediaPreview {
-            placeholder: text_from_string(fallback),
-            kitty: None,
-            cols: 0,
-            rows: 0,
-            limited_cols: false,
-            limited_rows: false,
-        }));
-    }
-
-    if !is_kitty_terminal() {
-        let fallback = indent_media_preview(&format!(
-            "[inline image preview disabled; set REDDIX_FORCE_KITTY=1 to re-enable if your terminal supports the Kitty protocol. Image: {}]",
             image_label(&url)
         ));
         return Ok(Some(MediaPreview {
@@ -2320,6 +2312,76 @@ fn save_media_batch(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KittyStatus {
+    Unknown,
+    Supported,
+    Unsupported,
+    ForcedEnabled,
+    ForcedDisabled,
+}
+
+impl KittyStatus {
+    fn is_enabled(self) -> bool {
+        matches!(self, KittyStatus::Supported | KittyStatus::ForcedEnabled)
+    }
+
+    fn is_forced(self) -> bool {
+        matches!(
+            self,
+            KittyStatus::ForcedEnabled | KittyStatus::ForcedDisabled
+        )
+    }
+}
+
+static KITTY_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn determine_initial_kitty_status() -> KittyStatus {
+    if env_truthy("REDDIX_DISABLE_KITTY") {
+        return KittyStatus::ForcedDisabled;
+    }
+    if env_truthy("REDDIX_FORCE_KITTY") {
+        return KittyStatus::ForcedEnabled;
+    }
+    let enable_override = env_truthy("REDDIX_ENABLE_KITTY");
+    if running_inside_tmux() && !enable_override {
+        return KittyStatus::Unsupported;
+    }
+    if enable_override {
+        return KittyStatus::ForcedEnabled;
+    }
+    if env::var("KITTY_WINDOW_ID")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return KittyStatus::Supported;
+    }
+    if terminal_hints_kitty_support() {
+        return KittyStatus::Supported;
+    }
+    KittyStatus::Unknown
+}
+
+fn terminal_hints_kitty_support() -> bool {
+    fn matches_known(value: &str) -> bool {
+        let lower = value.to_ascii_lowercase();
+        const KEYWORDS: [&str; 6] = ["kitty", "wezterm", "ghostty", "konsole", "warp", "wayst"];
+        if KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+            return true;
+        }
+        lower == "st" || lower.starts_with("st-")
+    }
+
+    env::var("TERM")
+        .ok()
+        .filter(|term| matches_known(term))
+        .is_some()
+        || env::var("TERM_PROGRAM")
+            .ok()
+            .filter(|program| matches_known(program))
+            .is_some()
+}
+
 fn env_truthy(key: &str) -> bool {
     env::var(key)
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
@@ -2341,44 +2403,238 @@ fn running_inside_tmux() -> bool {
         .unwrap_or(false)
 }
 
-fn is_kitty_terminal() -> bool {
-    if env_truthy("REDDIX_DISABLE_KITTY") {
-        return false;
-    }
-    if env_truthy("REDDIX_FORCE_KITTY") {
-        return true;
-    }
-    let enable_override = env_truthy("REDDIX_ENABLE_KITTY");
-    if running_inside_tmux() && !enable_override {
-        return false;
-    }
-    if enable_override {
-        return true;
-    }
-    if env::var("KITTY_WINDOW_ID")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    if env::var("WEZTERM_PANE")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    if env::var("TERM_PROGRAM")
-        .map(|term| term.to_lowercase().contains("wezterm"))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    env::var("TERM")
-        .map(|term| {
-            let lower = term.to_lowercase();
-            lower.contains("kitty") || lower.contains("wezterm")
+fn detect_kitty_graphics() -> Result<bool> {
+    probe_kitty_graphics(Duration::from_millis(KITTY_PROBE_TIMEOUT_MS))
+}
+
+#[cfg(unix)]
+struct TtyModeGuard {
+    fd: RawFd,
+    original_flags: i32,
+    original_termios: libc::termios,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventKind {
+    KittyResponse,
+    DeviceAttributes,
+    OtherEscape,
+}
+
+#[cfg(unix)]
+impl TtyModeGuard {
+    fn new(fd: RawFd) -> Result<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error()).context("read tty flags");
+        }
+
+        let mut termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return Err(io::Error::last_os_error()).context("read tty attributes");
+        }
+
+        Ok(Self {
+            fd,
+            original_flags: flags,
+            original_termios: termios,
         })
-        .unwrap_or(false)
+    }
+
+    fn enter_raw_nonblocking(&self) -> Result<()> {
+        let mut raw = self.original_termios;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_iflag &= !(libc::IXON | libc::IXOFF);
+        raw.c_oflag &= !libc::OPOST;
+        #[allow(clippy::unnecessary_cast)]
+        {
+            raw.c_cc[libc::VMIN as usize] = 0;
+            raw.c_cc[libc::VTIME as usize] = 0;
+        }
+
+        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error()).context("set raw tty mode");
+        }
+
+        if unsafe {
+            libc::fcntl(
+                self.fd,
+                libc::F_SETFL,
+                self.original_flags | libc::O_NONBLOCK,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error()).context("set nonblocking tty mode");
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TtyModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original_termios);
+            libc::fcntl(self.fd, libc::F_SETFL, self.original_flags);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn extract_event(buffer: &mut Vec<u8>) -> Option<EventKind> {
+    let mut idx = 0;
+    while idx + 1 < buffer.len() {
+        if buffer[idx] != 0x1b {
+            idx += 1;
+            continue;
+        }
+        let next = buffer[idx + 1];
+        match next {
+            b'G' => {
+                if let Some(end) = find_esc_backslash(&buffer[idx + 2..]) {
+                    let end_idx = idx + 2 + end;
+                    buffer.drain(idx..=end_idx + 1);
+                    return Some(EventKind::KittyResponse);
+                }
+                break;
+            }
+            b'[' => {
+                if let Some(end_idx) = find_csi_terminator(&buffer[idx + 2..]) {
+                    let absolute = idx + 2 + end_idx;
+                    buffer.drain(idx..=absolute);
+                    return Some(EventKind::DeviceAttributes);
+                }
+                break;
+            }
+            _ => {
+                if let Some(end_idx) = find_escape_terminated(&buffer[idx + 1..]) {
+                    let absolute = idx + 1 + end_idx;
+                    buffer.drain(idx..=absolute);
+                    return Some(EventKind::OtherEscape);
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn find_esc_backslash(slice: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < slice.len() {
+        if slice[i] == 0x1b && slice[i + 1] == b'\\' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(unix)]
+fn find_csi_terminator(slice: &[u8]) -> Option<usize> {
+    for (offset, byte) in slice.iter().enumerate() {
+        if (0x40..=0x7e).contains(byte) {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn find_escape_terminated(slice: &[u8]) -> Option<usize> {
+    for (offset, byte) in slice.iter().enumerate() {
+        if (0x40..=0x7e).contains(byte) {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn probe_kitty_graphics(timeout: Duration) -> Result<bool> {
+    let mut tty = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(tty) => tty,
+        Err(err) => return Err(err).context("open /dev/tty for kitty probe"),
+    };
+
+    let fd = tty.as_raw_fd();
+    let guard = TtyModeGuard::new(fd)?;
+    guard.enter_raw_nonblocking()?;
+
+    let query = b"\x1b_Gi=1,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+    tty.write_all(query)
+        .context("write kitty query escape sequence")?;
+    let _ = tty.flush();
+
+    let deadline = Instant::now() + timeout;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut first_event: Option<EventKind> = None;
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining
+            .as_millis()
+            .min(i32::MAX as u128)
+            .try_into()
+            .unwrap_or(i32::MAX);
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if poll_result < 0 {
+            return Err(io::Error::last_os_error()).context("poll for kitty probe response");
+        }
+        if poll_result == 0 {
+            continue;
+        }
+        if (pollfd.revents & libc::POLLIN) == 0 {
+            continue;
+        }
+
+        let mut chunk = [0u8; 512];
+        loop {
+            match tty.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err).context("read kitty probe response"),
+            }
+        }
+
+        while let Some(event) = extract_event(&mut buffer) {
+            if first_event.is_none()
+                && matches!(
+                    event,
+                    EventKind::KittyResponse | EventKind::DeviceAttributes
+                )
+            {
+                first_event = Some(event);
+            }
+            if matches!(event, EventKind::KittyResponse) {
+                drop(guard);
+                return Ok(true);
+            }
+        }
+    }
+
+    drop(guard);
+    Ok(matches!(first_event, Some(EventKind::KittyResponse)))
+}
+
+#[cfg(not(unix))]
+fn probe_kitty_graphics(_timeout: Duration) -> Result<bool> {
+    Ok(false)
 }
 
 fn clamp_dimensions(width: i64, height: i64, max_width: i32, max_height: i32) -> (i32, i32) {
@@ -2559,6 +2815,8 @@ pub struct Model {
     pending_comments: Option<PendingComments>,
     pending_subreddits: Option<PendingSubreddits>,
     clipboard: Option<Clipboard>,
+    kitty_status: KittyStatus,
+    kitty_probe_in_progress: bool,
 }
 
 impl Model {
@@ -2607,6 +2865,90 @@ impl Model {
 
     fn has_update_banner(&self) -> bool {
         self.update_notice.is_some()
+    }
+
+    fn initialize_kitty_detection(&mut self) {
+        self.kitty_probe_in_progress = false;
+        if cfg!(test) {
+            self.apply_kitty_status(KittyStatus::Unsupported);
+            return;
+        }
+        let status = determine_initial_kitty_status();
+        self.apply_kitty_status(status);
+        self.queue_kitty_detection_if_needed();
+    }
+
+    fn queue_kitty_detection_if_needed(&mut self) {
+        if self.kitty_status != KittyStatus::Unknown || self.kitty_probe_in_progress {
+            return;
+        }
+        if !env_truthy("REDDIX_EXPERIMENTAL_KITTY_PROBE") {
+            return;
+        }
+        if KITTY_PROBE_STARTED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.kitty_probe_in_progress = true;
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let result = detect_kitty_graphics();
+            let _ = tx.send(AsyncResponse::KittyProbe { result });
+        });
+    }
+
+    fn handle_kitty_probe(&mut self, result: Result<bool>) {
+        self.kitty_probe_in_progress = false;
+        if self.kitty_status.is_forced() {
+            return;
+        }
+        match result {
+            Ok(true) => {
+                if self.kitty_status == KittyStatus::Unknown {
+                    self.apply_kitty_status(KittyStatus::Supported);
+                    self.status_message =
+                        "Kitty graphics detected. Inline previews enabled.".to_string();
+                }
+            }
+            Ok(false) => {
+                if self.kitty_status == KittyStatus::Unknown {
+                    self.apply_kitty_status(KittyStatus::Unsupported);
+                }
+            }
+            Err(err) => {
+                if self.kitty_status == KittyStatus::Unknown {
+                    self.apply_kitty_status(KittyStatus::Unsupported);
+                }
+                self.status_message = format!("Kitty graphics detection failed: {}", err);
+            }
+        }
+        self.mark_dirty();
+    }
+
+    fn apply_kitty_status(&mut self, status: KittyStatus) {
+        if self.kitty_status == status {
+            return;
+        }
+        self.kitty_status = status;
+        if status.is_enabled() {
+            if let Some(post) = self.posts.get(self.selected_post).cloned() {
+                let key = post.post.name.clone();
+                if let Some(cancel) = self.pending_media.remove(&key) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                self.media_failures.remove(&key);
+                self.media_previews.remove(&key);
+                self.ensure_media_request_ready(&post);
+            }
+        } else if matches!(
+            status,
+            KittyStatus::Unsupported | KittyStatus::ForcedDisabled
+        ) {
+            self.queue_active_kitty_delete();
+        }
+        self.mark_dirty();
     }
 
     fn banner_selected(&self) -> bool {
@@ -3232,6 +3574,8 @@ impl Model {
             pending_comments: None,
             pending_subreddits: None,
             clipboard: None,
+            kitty_status: KittyStatus::Unknown,
+            kitty_probe_in_progress: false,
         };
         model.cache_scope = model.current_cache_scope();
         model.subreddits = model
@@ -3271,6 +3615,8 @@ impl Model {
             model.nav_mode = NavMode::Sorts;
         }
         model.ensure_subreddit_visible();
+
+        model.initialize_kitty_detection();
 
         if let Err(err) = model.reload_posts() {
             model.status_message = format!("Failed to load posts: {err}");
@@ -5769,6 +6115,9 @@ impl Model {
                     }
                 }
                 self.mark_dirty();
+            }
+            AsyncResponse::KittyProbe { result } => {
+                self.handle_kitty_probe(result);
             }
             AsyncResponse::JoinStatus { account_id, result } => {
                 let state = self.join_states.entry(account_id).or_default();
