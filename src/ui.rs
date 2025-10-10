@@ -241,6 +241,7 @@ enum ActionMenuAction {
     OpenLinks,
     SaveMedia,
     OpenNavigation,
+    ToggleFullscreen,
 }
 
 #[derive(Clone)]
@@ -1449,6 +1450,7 @@ fn load_media_preview(
     media_handle: Option<media::Handle>,
     max_cols: i32,
     max_rows: i32,
+    allow_upscale: bool,
 ) -> Result<Option<MediaPreview>> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -1502,12 +1504,26 @@ fn load_media_preview(
         bail!("preview image empty");
     }
 
-    let capped_cols = max_cols.clamp(1, MAX_IMAGE_COLS);
-    let capped_rows = max_rows.clamp(1, MAX_IMAGE_ROWS);
-    let (cols, rows) = clamp_dimensions(source.width, source.height, capped_cols, capped_rows);
+    let capped_cols = if max_cols > MAX_IMAGE_COLS {
+        max_cols.max(1)
+    } else {
+        max_cols.clamp(1, MAX_IMAGE_COLS)
+    };
+    let capped_rows = if max_rows > MAX_IMAGE_ROWS {
+        max_rows.max(1)
+    } else {
+        max_rows.clamp(1, MAX_IMAGE_ROWS)
+    };
+    let (cols, rows) = clamp_dimensions(
+        source.width,
+        source.height,
+        capped_cols,
+        capped_rows,
+        allow_upscale,
+    );
     let label = image_label(&url);
-    let limited_cols = max_cols < MAX_IMAGE_COLS && cols >= max_cols;
-    let limited_rows = max_rows < MAX_IMAGE_ROWS && rows >= max_rows;
+    let limited_cols = cols >= capped_cols && (source.width as i32) > capped_cols;
+    let limited_rows = rows >= capped_rows && (source.height as i32) > capped_rows;
 
     if cols < MIN_IMAGE_COLS || rows < MIN_IMAGE_ROWS {
         let fallback = indent_media_preview(&format!(
@@ -2637,7 +2653,13 @@ fn probe_kitty_graphics(_timeout: Duration) -> Result<bool> {
     Ok(false)
 }
 
-fn clamp_dimensions(width: i64, height: i64, max_width: i32, max_height: i32) -> (i32, i32) {
+fn clamp_dimensions(
+    width: i64,
+    height: i64,
+    max_width: i32,
+    max_height: i32,
+    allow_upscale: bool,
+) -> (i32, i32) {
     let metrics = terminal_cell_metrics();
     let cell_width = metrics.width.max(1.0);
     let cell_height = metrics.height.max(1.0);
@@ -2669,7 +2691,7 @@ fn clamp_dimensions(width: i64, height: i64, max_width: i32, max_height: i32) ->
     let scale_x = max_width_cells / native_cols;
     let scale_y = max_height_cells / native_rows;
     let mut scale = scale_x.min(scale_y);
-    if scale > 1.0 {
+    if !allow_upscale && scale > 1.0 {
         scale = 1.0;
     }
     if scale <= 0.0 {
@@ -2745,6 +2767,9 @@ pub struct Model {
     media_layouts: HashMap<String, MediaLayout>,
     media_handle: Option<media::Handle>,
     media_constraints: MediaConstraints,
+    media_fullscreen: bool,
+    media_fullscreen_prev_focus: Option<Pane>,
+    media_fullscreen_prev_scroll: Option<u16>,
     feed_cache: HashMap<FeedCacheKey, FeedCacheEntry>,
     comment_cache: HashMap<CommentCacheKey, CommentCacheEntry>,
     post_rows: HashMap<String, PostRowData>,
@@ -3477,6 +3502,22 @@ impl Model {
             .is_some_and(MediaPreview::has_kitty)
     }
 
+    fn can_toggle_fullscreen_preview(&self) -> bool {
+        if self.media_fullscreen {
+            return true;
+        }
+        if self.banner_selected() {
+            return false;
+        }
+        if !self.kitty_status.is_enabled() {
+            return false;
+        }
+        let Some(post) = self.posts.get(self.selected_post) else {
+            return false;
+        };
+        select_preview_source(&post.post).is_some()
+    }
+
     pub fn new(opts: Options) -> Self {
         let current_version = resolve_current_version();
         let markdown = markdown::Renderer::new();
@@ -3504,6 +3545,9 @@ impl Model {
                 cols: MAX_IMAGE_COLS,
                 rows: MAX_IMAGE_ROWS,
             },
+            media_fullscreen: false,
+            media_fullscreen_prev_focus: None,
+            media_fullscreen_prev_scroll: None,
             feed_cache: HashMap::new(),
             comment_cache: HashMap::new(),
             post_rows: HashMap::new(),
@@ -3828,6 +3872,11 @@ impl Model {
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 self.open_action_menu();
                 return Ok(false);
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.toggle_media_fullscreen()?;
+                }
             }
             KeyCode::Char('u') => {
                 if self.banner_selected() {
@@ -4402,6 +4451,19 @@ impl Model {
         }
         entries.push(media_entry);
 
+        let fullscreen_available = self.can_toggle_fullscreen_preview();
+        let fullscreen_label = if self.media_fullscreen {
+            "Exit fullscreen preview"
+        } else {
+            "View media fullscreen"
+        };
+        let mut fullscreen_entry =
+            ActionMenuEntry::new(fullscreen_label, ActionMenuAction::ToggleFullscreen);
+        if !fullscreen_available {
+            fullscreen_entry = fullscreen_entry.disabled();
+        }
+        entries.push(fullscreen_entry);
+
         entries.push(ActionMenuEntry::new(
             "Search subreddits & users…",
             ActionMenuAction::OpenNavigation,
@@ -4838,6 +4900,19 @@ impl Model {
                                 if self.action_menu_selected >= self.action_menu_items.len() {
                                     self.action_menu_selected =
                                         self.action_menu_items.len().saturating_sub(1);
+                                }
+                            }
+                            ActionMenuAction::ToggleFullscreen => {
+                                let was_fullscreen = self.media_fullscreen;
+                                self.toggle_media_fullscreen()?;
+                                if self.media_fullscreen != was_fullscreen {
+                                    self.close_action_menu(None);
+                                } else {
+                                    self.action_menu_items = self.build_action_menu_entries();
+                                    if self.action_menu_selected >= self.action_menu_items.len() {
+                                        self.action_menu_selected =
+                                            self.action_menu_items.len().saturating_sub(1);
+                                    }
                                 }
                             }
                             ActionMenuAction::OpenNavigation => {
@@ -5472,6 +5547,7 @@ impl Model {
                 "Extras",
                 vec![
                     ("y", "Copy the highlighted comment"),
+                    ("f", "Toggle fullscreen media preview"),
                     ("U", "Run the available updater"),
                     ("q / Esc", "Quit Reddix"),
                 ],
@@ -7729,12 +7805,92 @@ impl Model {
                     Style::default().fg(COLOR_TEXT_SECONDARY),
                 ))]);
                 self.content = self.compose_content(placeholder, &post);
-                self.queue_content_render(key, source);
+                self.queue_content_render(key.clone(), source);
+            }
+
+            if self.media_fullscreen {
+                self.content = self.compose_fullscreen_preview(&post);
             }
         } else {
             self.content_source = self.fallback_source.clone();
             self.content = self.fallback_content.clone();
         }
+    }
+
+    fn toggle_media_fullscreen(&mut self) -> Result<()> {
+        if self.media_fullscreen {
+            let previous_focus = self.media_fullscreen_prev_focus.take();
+            let previous_scroll = self.media_fullscreen_prev_scroll.take();
+            self.media_fullscreen = false;
+            if let Some(focus) = previous_focus {
+                self.focused_pane = focus;
+            }
+            self.queue_active_kitty_delete();
+            self.sync_content_from_selection();
+            if let Some(scroll) = previous_scroll {
+                let max_scroll = self
+                    .content
+                    .lines
+                    .len()
+                    .saturating_sub(1)
+                    .min(u16::MAX as usize) as u16;
+                self.content_scroll = scroll.min(max_scroll);
+            }
+            self.status_message = "Fullscreen preview closed.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        if !self.kitty_status.is_enabled() {
+            self.status_message = "Inline previews are disabled in this terminal.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        if self.banner_selected() {
+            self.status_message = "Select a post before toggling the preview.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let Some(post) = self.posts.get(self.selected_post).cloned() else {
+            self.status_message =
+                "Select a post with media before toggling fullscreen.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        if select_preview_source(&post.post).is_none() {
+            self.status_message = "This post has no inline preview.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let key = post.post.name.clone();
+        self.media_fullscreen_prev_focus = Some(self.focused_pane);
+        self.media_fullscreen_prev_scroll = Some(self.content_scroll);
+        self.media_fullscreen = true;
+        self.focused_pane = Pane::Content;
+        self.content_scroll = 0;
+        self.queue_active_kitty_delete();
+
+        if let Some(cancel) = self.pending_media.remove(&key) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if self
+            .media_previews
+            .get(&key)
+            .is_some_and(|preview| preview.limited_cols() || preview.limited_rows())
+        {
+            self.media_previews.remove(&key);
+        }
+        self.media_failures.remove(&key);
+        self.media_layouts.remove(&key);
+
+        self.sync_content_from_selection();
+        self.status_message = "Fullscreen preview enabled. Press f to return.".to_string();
+        self.mark_dirty();
+        Ok(())
     }
 
     fn request_media_preview(&mut self, post: &reddit::Post) {
@@ -7747,7 +7903,7 @@ impl Model {
         }
 
         let (max_cols, max_rows) = self.media_constraints();
-        self.request_media_preview_with_limits(post, max_cols, max_rows);
+        self.request_media_preview_with_limits(post, max_cols, max_rows, false);
     }
 
     fn request_media_preview_with_limits(
@@ -7755,6 +7911,7 @@ impl Model {
         post: &reddit::Post,
         max_cols: i32,
         max_rows: i32,
+        allow_upscale: bool,
     ) {
         let key = post.name.clone();
         if self.pending_media.contains_key(&key) {
@@ -7778,6 +7935,7 @@ impl Model {
                 media_handle,
                 max_cols,
                 max_rows,
+                allow_upscale,
             );
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
@@ -7793,11 +7951,27 @@ impl Model {
         (self.media_constraints.cols, self.media_constraints.rows)
     }
 
-    fn update_media_constraints(&mut self, area: Rect) -> bool {
-        let available_cols = area.width.saturating_sub(MEDIA_INDENT).max(1) as i32;
-        let available_rows = area.height.saturating_sub(1).max(1) as i32;
-        let cols = MAX_IMAGE_COLS.min(available_cols.max(1));
-        let rows = MAX_IMAGE_ROWS.min(available_rows.max(1));
+    fn update_media_constraints(&mut self, area: Rect, fullscreen: bool) -> bool {
+        let available_cols = if fullscreen {
+            area.width.max(1) as i32
+        } else {
+            area.width.saturating_sub(MEDIA_INDENT).max(1) as i32
+        };
+        let available_rows = if fullscreen {
+            area.height.max(1) as i32
+        } else {
+            area.height.saturating_sub(1).max(1) as i32
+        };
+        let cols = if fullscreen {
+            available_cols.max(1)
+        } else {
+            MAX_IMAGE_COLS.min(available_cols.max(1))
+        };
+        let rows = if fullscreen {
+            available_rows.max(1)
+        } else {
+            MAX_IMAGE_ROWS.min(available_rows.max(1))
+        };
         let new_constraints = MediaConstraints { cols, rows };
         if new_constraints != self.media_constraints {
             self.media_constraints = new_constraints;
@@ -7944,6 +8118,11 @@ impl Model {
         let full = frame.size();
         frame.render_widget(Block::default().style(Style::default().bg(COLOR_BG)), full);
 
+        if self.media_fullscreen {
+            self.draw_content(frame, full);
+            return;
+        }
+
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -7974,19 +8153,23 @@ impl Model {
         );
         frame.render_widget(status_line, layout[0]);
 
-        let window = self.visible_panes();
-        let constraints = pane_constraints(&window);
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(constraints)
-            .split(layout[1]);
+        if self.media_fullscreen {
+            self.draw_content(frame, layout[1]);
+        } else {
+            let window = self.visible_panes();
+            let constraints = pane_constraints(&window);
+            let main_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(constraints)
+                .split(layout[1]);
 
-        for (pane, area) in window.iter().zip(main_chunks.iter()) {
-            match pane {
-                Pane::Navigation => self.draw_subreddits(frame, *area),
-                Pane::Posts => self.draw_posts(frame, *area),
-                Pane::Content => self.draw_content(frame, *area),
-                Pane::Comments => self.draw_comments(frame, *area),
+            for (pane, area) in window.iter().zip(main_chunks.iter()) {
+                match pane {
+                    Pane::Navigation => self.draw_subreddits(frame, *area),
+                    Pane::Posts => self.draw_posts(frame, *area),
+                    Pane::Content => self.draw_content(frame, *area),
+                    Pane::Comments => self.draw_comments(frame, *area),
+                }
             }
         }
 
@@ -8161,8 +8344,13 @@ impl Model {
         } else {
             Style::default().fg(COLOR_TEXT_SECONDARY)
         };
+        let title_text = if pane == Pane::Content && self.media_fullscreen {
+            "Media Preview (fullscreen)"
+        } else {
+            pane.title()
+        };
         Block::default()
-            .title(Span::styled(pane.title(), title_style))
+            .title(Span::styled(title_text, title_style))
             .borders(Borders::ALL)
             .border_style(border_style)
             .style(Style::default().bg(COLOR_PANEL_BG))
@@ -8726,7 +8914,7 @@ impl Model {
                 self.media_previews.remove(&key);
                 self.media_failures.remove(&key);
                 self.queue_active_kitty_delete();
-                self.request_media_preview_with_limits(&post.post, max_cols, max_rows);
+                self.request_media_preview_with_limits(&post.post, max_cols, max_rows, true);
 
                 if !lines.is_empty() && !line_is_blank(lines.last().unwrap()) {
                     lines.push(Line::raw(String::new()));
@@ -8785,11 +8973,128 @@ impl Model {
         }
     }
 
+    fn compose_fullscreen_preview(&mut self, post: &PostPreview) -> Text<'static> {
+        let key = post.post.name.clone();
+        self.media_layouts.remove(&key);
+
+        if !self.kitty_status.is_enabled() {
+            return Text::from(vec![
+                Line::from(Span::styled(
+                    "Inline previews are disabled in this terminal.",
+                    Style::default().fg(COLOR_TEXT_SECONDARY),
+                )),
+                Line::default(),
+                self.fullscreen_hint_line(),
+            ]);
+        }
+
+        let (max_cols, max_rows) = self.media_constraints();
+
+        let available_cols = self.media_constraints.cols.max(1);
+        let available_rows = self.media_constraints.rows.max(1);
+
+        if let Some(preview) = self.media_previews.get(&key).cloned() {
+            let (cols, rows) = preview.dims();
+            let expand_cols = preview.limited_cols() && max_cols > cols;
+            let expand_rows = preview.limited_rows() && max_rows > rows;
+
+            if expand_cols || expand_rows {
+                if let Some(cancel) = self.pending_media.remove(&key) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                self.media_previews.remove(&key);
+                self.media_failures.remove(&key);
+                self.request_media_preview_with_limits(&post.post, max_cols, max_rows, true);
+                self.media_layouts.insert(
+                    key,
+                    MediaLayout {
+                        line_offset: 0,
+                        indent: 0,
+                    },
+                );
+                return Text::from(vec![Line::from(Span::styled(
+                    "Loading preview...",
+                    Style::default().fg(COLOR_TEXT_SECONDARY),
+                ))]);
+            }
+
+            let indent = ((available_cols - cols).max(0) / 2) as u16;
+            let top_padding = ((available_rows - rows).max(0) / 2) as usize;
+
+            let mut lines = Vec::with_capacity(top_padding + preview.placeholder().lines.len() + 3);
+            lines.resize_with(top_padding, Line::default);
+            lines.extend(preview.placeholder().lines.clone());
+            self.media_layouts.insert(
+                key,
+                MediaLayout {
+                    line_offset: top_padding,
+                    indent,
+                },
+            );
+            if preview.has_kitty() {
+                self.needs_kitty_flush = true;
+            }
+            if preview.limited_cols() || preview.limited_rows() {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Preview scaled to fit current viewport.",
+                    Style::default().fg(COLOR_TEXT_SECONDARY),
+                )));
+            }
+            lines.push(Line::default());
+            lines.push(self.fullscreen_hint_line());
+            return Text::from(lines);
+        }
+
+        if self.media_failures.contains(&key) {
+            return Text::from(vec![
+                Line::from(Span::styled(
+                    "Failed to load preview.",
+                    Style::default().fg(COLOR_ERROR),
+                )),
+                Line::default(),
+                self.fullscreen_hint_line(),
+            ]);
+        }
+
+        if !self.pending_media.contains_key(&key) {
+            self.request_media_preview_with_limits(&post.post, max_cols, max_rows, true);
+        }
+        self.media_layouts.insert(
+            key,
+            MediaLayout {
+                line_offset: 0,
+                indent: 0,
+            },
+        );
+        Text::from(vec![
+            Line::from(Span::styled(
+                "Loading preview...",
+                Style::default().fg(COLOR_TEXT_SECONDARY),
+            )),
+            Line::default(),
+            self.fullscreen_hint_line(),
+        ])
+    }
+
+    fn fullscreen_hint_line(&self) -> Line<'static> {
+        Line::from(Span::styled(
+            "Press f to return · j/k scroll",
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::ITALIC),
+        ))
+    }
+
     fn refresh_selected_post_media(&mut self) {
         let Some(post) = self.posts.get(self.selected_post).cloned() else {
             return;
         };
         let key = post.post.name.clone();
+        if self.media_fullscreen {
+            self.content = self.compose_fullscreen_preview(&post);
+            return;
+        }
         if let Some(rendered) = self.content_cache.get(&key).cloned() {
             let scroll = self.content_scroll;
             self.content = self.compose_content(rendered, &post);
@@ -8837,21 +9142,38 @@ impl Model {
     }
 
     fn draw_content(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let block = self.pane_block(Pane::Content);
-        let inner = block.inner(area);
-        let constraints_changed = self.update_media_constraints(inner);
-        self.content_area = Some(inner);
-        if constraints_changed {
-            self.refresh_selected_post_media();
+        if self.media_fullscreen {
+            frame.render_widget(Clear, area);
+            let constraints_changed = self.update_media_constraints(area, true);
+            self.content_area = Some(area);
+            if constraints_changed {
+                self.refresh_selected_post_media();
+            }
+            if self.selected_post_has_kitty_preview() {
+                self.needs_kitty_flush = true;
+            }
+            let paragraph = Paragraph::new(self.content.clone())
+                .style(Style::default().bg(COLOR_PANEL_BG).fg(COLOR_TEXT_PRIMARY))
+                .wrap(Wrap { trim: false })
+                .scroll((self.content_scroll, 0));
+            frame.render_widget(paragraph, area);
+        } else {
+            let block = self.pane_block(Pane::Content);
+            let inner = block.inner(area);
+            let constraints_changed = self.update_media_constraints(inner, false);
+            self.content_area = Some(inner);
+            if constraints_changed {
+                self.refresh_selected_post_media();
+            }
+            if self.selected_post_has_kitty_preview() {
+                self.needs_kitty_flush = true;
+            }
+            let paragraph = Paragraph::new(self.content.clone())
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((self.content_scroll, 0));
+            frame.render_widget(paragraph, area);
         }
-        if self.selected_post_has_kitty_preview() {
-            self.needs_kitty_flush = true;
-        }
-        let paragraph = Paragraph::new(self.content.clone())
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.content_scroll, 0));
-        frame.render_widget(paragraph, area);
     }
 
     fn draw_comments(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -9486,6 +9808,10 @@ impl Model {
             return "Actions: j/k move · Enter/l open · h/Esc close".to_string();
         }
 
+        if self.media_fullscreen {
+            return "Fullscreen preview: f return · j/k scroll".to_string();
+        }
+
         let mut parts: Vec<String> = Vec::new();
 
         match self.focused_pane {
@@ -9506,6 +9832,9 @@ impl Model {
             }
             Pane::Content => {
                 parts.push("Content: ↑/↓ scroll".to_string());
+                if self.can_toggle_fullscreen_preview() {
+                    parts.push("f fullscreen preview".to_string());
+                }
             }
             Pane::Comments => {
                 if self.pending_comments.is_some() {
