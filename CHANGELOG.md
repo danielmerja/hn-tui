@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.18] - 2025-10-10
+### Fixed
+- Prevented inline media previews from overflowing on very narrow terminals and rescaled them automatically when the viewport changes.
+
 ## [0.1.17] - 2025-10-09
 ### Added
 - `?` help overlay with grouped keybindings and contextual sections.
@@ -95,7 +99,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/ck-zhang/reddix/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/ck-zhang/reddix/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/ck-zhang/reddix/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/ck-zhang/reddix/compare/v0.1.14...v0.1.15
