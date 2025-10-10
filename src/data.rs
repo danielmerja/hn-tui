@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::reddit::{self, CommentSortOption, ListingOptions, SortOption};
@@ -66,15 +67,42 @@ impl RedditSubredditService {
 
 impl SubredditService for RedditSubredditService {
     fn list_subreddits(&self, source: reddit::SubredditSource) -> Result<Vec<reddit::Subreddit>> {
-        let listing = self
-            .client
-            .subreddits(source, ListingOptions::default())
-            .context("fetch subreddit listing")?;
-        Ok(listing
-            .children
-            .into_iter()
-            .map(|thing| thing.data)
-            .collect())
+        const PER_PAGE: u32 = 100;
+        const MAX_PAGES: usize = 100;
+
+        let mut all = Vec::new();
+        let mut seen = HashSet::new();
+        let mut after: Option<String> = None;
+
+        for _ in 0..MAX_PAGES {
+            let opts = ListingOptions {
+                limit: Some(PER_PAGE),
+                after: after.clone(),
+                ..Default::default()
+            };
+
+            let listing = self
+                .client
+                .subreddits(source, opts)
+                .context("fetch subreddit listing page")?;
+
+            let next_after = listing.after.clone();
+
+            for thing in listing.children {
+                let subreddit = thing.data;
+                if seen.insert(subreddit.id.clone()) {
+                    all.push(subreddit);
+                }
+            }
+
+            if next_after.is_none() || next_after == after {
+                break;
+            }
+
+            after = next_after;
+        }
+
+        Ok(all)
     }
 }
 
