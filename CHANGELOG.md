@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.1.19] - 2025-10-10
+### Changed
+- Always emit Kitty inline media previews so supported terminals render images instantly while others simply show empty space.
+- Made the Kitty probe opt-in via `REDDIX_EXPERIMENTAL_KITTY_PROBE` to dodge glitchy terminals.
+
 ## [0.1.18] - 2025-10-10
 ### Fixed
 - Prevented inline media previews from overflowing on very narrow terminals and rescaled them automatically when the viewport changes.
@@ -99,7 +104,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/ck-zhang/reddix/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/ck-zhang/reddix/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/ck-zhang/reddix/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/ck-zhang/reddix/compare/v0.1.15...v0.1.16
