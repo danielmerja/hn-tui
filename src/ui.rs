@@ -22,7 +22,8 @@ use arboard::Clipboard;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
@@ -247,6 +248,7 @@ enum ActionMenuAction {
     SaveMedia,
     StartVideo,
     StopVideo,
+    OpenVideoExternal,
     OpenNavigation,
     ToggleFullscreen,
 }
@@ -1548,6 +1550,7 @@ fn content_from_post(post: &PostPreview) -> String {
     post.body.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_media_preview(
     post: &reddit::Post,
     cancel_flag: &AtomicBool,
@@ -1555,6 +1558,7 @@ fn load_media_preview(
     max_cols: i32,
     max_rows: i32,
     allow_upscale: bool,
+    allow_inline_video: bool,
     priority: media::Priority,
 ) -> Result<MediaLoadOutcome> {
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1574,35 +1578,41 @@ fn load_media_preview(
         max_rows.clamp(1, MAX_IMAGE_ROWS)
     };
 
-    if let Some(video_source) = video::find_video_source(post) {
-        let width_px = video_source.width.unwrap_or(TARGET_PREVIEW_WIDTH_PX);
-        let height_px = video_source.height.unwrap_or(((width_px * 9) / 16).max(1));
-        let (cols, rows) =
-            clamp_dimensions(width_px, height_px, capped_cols, capped_rows, allow_upscale);
-        let limited_cols = cols >= capped_cols && (width_px as i32) > capped_cols;
-        let limited_rows = rows >= capped_rows && (height_px as i32) > capped_rows;
-        let label = if video_source.label.trim().is_empty() {
-            "video"
-        } else {
-            video_source.label.trim()
-        };
-        video::debug_log(format!(
-            "resolved post={} url={} width={} height={} cols={} rows={}",
-            post.name, video_source.playback_url, width_px, height_px, cols, rows
-        ));
-        let placeholder = kitty_placeholder_text(cols, rows, MEDIA_INDENT, label);
-        return Ok(MediaLoadOutcome::Ready(MediaPreview {
-            placeholder,
-            kitty: None,
-            cols,
-            rows,
-            limited_cols,
-            limited_rows,
-            video: Some(VideoPreview {
-                source: video_source,
-            }),
-        }));
+    let video_source = video::find_video_source(post);
+
+    if allow_inline_video {
+        if let Some(video_source) = video_source.clone() {
+            let width_px = video_source.width.unwrap_or(TARGET_PREVIEW_WIDTH_PX);
+            let height_px = video_source.height.unwrap_or(((width_px * 9) / 16).max(1));
+            let (cols, rows) =
+                clamp_dimensions(width_px, height_px, capped_cols, capped_rows, allow_upscale);
+            let limited_cols = cols >= capped_cols && (width_px as i32) > capped_cols;
+            let limited_rows = rows >= capped_rows && (height_px as i32) > capped_rows;
+            let label = if video_source.label.trim().is_empty() {
+                "video"
+            } else {
+                video_source.label.trim()
+            };
+            video::debug_log(format!(
+                "resolved post={} url={} width={} height={} cols={} rows={}",
+                post.name, video_source.playback_url, width_px, height_px, cols, rows
+            ));
+            let placeholder = kitty_placeholder_text(cols, rows, MEDIA_INDENT, label);
+            return Ok(MediaLoadOutcome::Ready(MediaPreview {
+                placeholder,
+                kitty: None,
+                cols,
+                rows,
+                limited_cols,
+                limited_rows,
+                video: Some(VideoPreview {
+                    source: video_source,
+                }),
+            }));
+        }
     }
+
+    let video_preview = video_source.map(|source| VideoPreview { source });
 
     let source = match select_preview_source(post) {
         Some(src) => src,
@@ -1626,7 +1636,7 @@ fn load_media_preview(
             rows: 0,
             limited_cols: false,
             limited_rows: false,
-            video: None,
+            video: video_preview.clone(),
         }));
     }
 
@@ -1680,7 +1690,7 @@ fn load_media_preview(
             rows,
             limited_cols,
             limited_rows,
-            video: None,
+            video: video_preview.clone(),
         }));
     }
 
@@ -1696,7 +1706,7 @@ fn load_media_preview(
         rows,
         limited_cols,
         limited_rows,
-        video: None,
+        video: video_preview,
     }))
 }
 
@@ -2303,6 +2313,17 @@ fn collect_high_res_media(post: &reddit::Post) -> Vec<DownloadCandidate> {
             candidates.push(DownloadCandidate {
                 url: url.clone(),
                 suggested_name: image_label(&url),
+            });
+        }
+    }
+
+    if let Some(video_source) = video::find_video_source(post) {
+        let url = video_source.playback_url.clone();
+        if !url.trim().is_empty() && !candidates.iter().any(|candidate| candidate.url == url) {
+            let label = image_label(&url);
+            candidates.push(DownloadCandidate {
+                url,
+                suggested_name: label,
             });
         }
     }
@@ -3157,21 +3178,17 @@ impl Model {
             return;
         }
         self.kitty_status = status;
-        if status.is_enabled() {
-            if let Some(post) = self.posts.get(self.selected_post).cloned() {
-                let key = post.post.name.clone();
-                if let Some(cancel) = self.pending_media.remove(&key) {
-                    cancel.store(true, Ordering::SeqCst);
-                }
-                self.remove_pending_media_tracking(&key);
-                self.media_failures.remove(&key);
-                self.media_previews.remove(&key);
-                self.ensure_media_request_ready(&post);
+        if let Some(post) = self.posts.get(self.selected_post).cloned() {
+            let key = post.post.name.clone();
+            if let Some(cancel) = self.pending_media.remove(&key) {
+                cancel.store(true, Ordering::SeqCst);
             }
-        } else if matches!(
-            status,
-            KittyStatus::Unsupported | KittyStatus::ForcedDisabled
-        ) {
+            self.remove_pending_media_tracking(&key);
+            self.media_failures.remove(&key);
+            self.media_previews.remove(&key);
+            self.ensure_media_request_ready(&post);
+        }
+        if !status.is_enabled() {
             self.queue_active_kitty_delete();
         }
         self.mark_dirty();
@@ -3909,6 +3926,7 @@ impl Model {
         let mut stdout = io::stdout();
         enable_raw_mode()?;
         stdout.execute(EnterAlternateScreen)?;
+        stdout.execute(EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -3916,6 +3934,7 @@ impl Model {
         let result = self.event_loop(&mut terminal);
         let cleanup_result = self.cleanup_inline_media(terminal.backend_mut());
 
+        terminal.backend_mut().execute(DisableMouseCapture)?;
         disable_raw_mode()?;
         terminal.backend_mut().execute(LeaveAlternateScreen)?;
         terminal.show_cursor()?;
@@ -4774,17 +4793,23 @@ impl Model {
             }
         }
 
-        let (video_label, video_action, video_enabled) = if !self.kitty_status.is_enabled() {
-            (
-                "Inline video (enable Kitty previews)".to_string(),
-                ActionMenuAction::StartVideo,
-                false,
-            )
-        } else if !video_exists {
+        let (video_label, video_action, video_enabled) = if !video_exists {
             (
                 "Inline video (not available)".to_string(),
                 ActionMenuAction::StartVideo,
                 false,
+            )
+        } else if !self.kitty_status.is_enabled() {
+            let pending = self.pending_external_video.is_some();
+            let label = if pending {
+                "Open video in mpv (launching…)"
+            } else {
+                "Open video in mpv"
+            };
+            (
+                label.to_string(),
+                ActionMenuAction::OpenVideoExternal,
+                !pending,
             )
         } else if video_pending {
             (
@@ -5311,6 +5336,42 @@ impl Model {
                                             format!("Unable to start inline video: {}", err);
                                         self.mark_dirty();
                                     }
+                                }
+                            }
+                            ActionMenuAction::OpenVideoExternal => {
+                                if self.pending_external_video.is_some() {
+                                    self.status_message =
+                                        "Video launch already in progress.".to_string();
+                                    self.mark_dirty();
+                                } else if self.banner_selected() {
+                                    self.status_message =
+                                        "Select a post before launching the video player."
+                                            .to_string();
+                                    self.mark_dirty();
+                                } else if let Some(post) =
+                                    self.posts.get(self.selected_post).cloned()
+                                {
+                                    let source = self
+                                        .media_previews
+                                        .get(&post.post.name)
+                                        .and_then(|preview| {
+                                            preview.video().map(|video| video.source.clone())
+                                        })
+                                        .or_else(|| video::find_video_source(&post.post));
+                                    if let Some(source) = source {
+                                        self.launch_external_video(source);
+                                        self.close_action_menu(None);
+                                        return Ok(false);
+                                    } else {
+                                        self.status_message =
+                                            "No video available for the selected post.".to_string();
+                                        self.mark_dirty();
+                                    }
+                                } else {
+                                    self.status_message =
+                                        "Select a post with a video before launching the player."
+                                            .to_string();
+                                    self.mark_dirty();
                                 }
                             }
                             ActionMenuAction::StopVideo => {
@@ -8539,6 +8600,7 @@ impl Model {
         let tx = self.response_tx.clone();
         let post_clone = post.clone();
         let media_handle = self.media_handle.clone();
+        let allow_inline_video = self.kitty_status.is_enabled();
 
         thread::spawn(move || {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -8552,6 +8614,7 @@ impl Model {
                 max_cols,
                 max_rows,
                 allow_upscale,
+                allow_inline_video,
                 priority,
             );
             if cancel_flag.load(Ordering::SeqCst) {
