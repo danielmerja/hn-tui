@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.1] - 2025-10-13
+### Changed
+- Inline previews now detect Kitty support at runtime, falling back to the legacy image placeholder while offering an external mpv launch when graphics are unavailable.
+- Saving full-resolution media includes the original Reddit-hosted MP4 assets alongside images.
+### Fixed
+- Mouse capture is disabled on exit so terminals stop receiving stray pointer escape sequences after quitting.
+
 ## [0.2.0] - 2025-10-13
 ### Added
 - Inline Kitty/mpv video playback for Reddit-hosted posts directly in the content pane, launched on demand from the actions menu with a configurable `REDDIX_MPV_PATH` override.

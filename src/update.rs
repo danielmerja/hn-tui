@@ -258,13 +258,13 @@ mod tests {
     #[test]
     fn forced_update_returns_info_when_version_is_newer() {
         let _guard = guard_env();
-        env::set_var(FORCE_VERSION_ENV, "0.2.0");
-        env::set_var(FORCE_URL_ENV, "https://example.com/releases/0.2.0");
+        env::set_var(FORCE_VERSION_ENV, "0.2.1");
+        env::set_var(FORCE_URL_ENV, "https://example.com/releases/0.2.1");
         let current = Version::parse("0.1.0").unwrap();
         let info = forced_update(&current).unwrap().unwrap();
-        assert_eq!(info.version, Version::parse("0.2.0").unwrap());
-        assert_eq!(info.release_url, "https://example.com/releases/0.2.0");
-        assert_eq!(info.tag, "v0.2.0");
+        assert_eq!(info.version, Version::parse("0.2.1").unwrap());
+        assert_eq!(info.release_url, "https://example.com/releases/0.2.1");
+        assert_eq!(info.tag, "v0.2.1");
         env::remove_var(FORCE_VERSION_ENV);
         env::remove_var(FORCE_URL_ENV);
     }
