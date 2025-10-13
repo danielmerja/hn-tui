@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.0] - 2025-10-13
+### Added
+- Inline Kitty/mpv video playback for Reddit-hosted posts directly in the content pane, launched on demand from the actions menu with a configurable `REDDIX_MPV_PATH` override.
+### Changed
+- The actions menu now toggles inline video playback and reflects availability/status based on Kitty support and preview loading state.
+- Inline previews reuse the same mpv session in loop mode so videos replay seamlessly without wiping the interface.
+
 ## [0.1.21] - 2025-10-10
 ### Fixed
 - Retrieved the full subscription list by paging Reddit's API so the navigation pane shows every subreddit again.
