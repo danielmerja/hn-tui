@@ -93,6 +93,8 @@ pub struct MediaConfig {
     pub default_ttl: Duration,
     #[serde(default = "default_workers")]
     pub workers: usize,
+    #[serde(default = "default_media_queue_depth")]
+    pub max_queue_depth: usize,
 }
 
 impl Default for MediaConfig {
@@ -102,6 +104,7 @@ impl Default for MediaConfig {
             max_size_bytes: default_max_size_bytes(),
             default_ttl: default_media_ttl_duration(),
             workers: default_workers(),
+            max_queue_depth: default_media_queue_depth(),
         }
     }
 }
@@ -116,6 +119,10 @@ fn default_max_size_bytes() -> i64 {
 
 fn default_media_ttl_duration() -> Duration {
     Duration::from_secs(6 * 60 * 60)
+}
+
+fn default_media_queue_depth() -> usize {
+    16
 }
 
 fn default_workers() -> usize {
@@ -212,6 +219,9 @@ fn merge_config(mut base: Config, other: Config) -> Config {
     base.media.default_ttl = other.media.default_ttl;
     if other.media.workers != 0 {
         base.media.workers = other.media.workers;
+    }
+    if other.media.max_queue_depth != 0 {
+        base.media.max_queue_depth = other.media.max_queue_depth;
     }
 
     if !other.player.video_command.is_empty() {

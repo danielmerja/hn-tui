@@ -25,6 +25,7 @@ pub fn run() -> Result<()> {
         default_ttl: cfg.media.default_ttl,
         workers: cfg.media.workers,
         http_client: None,
+        max_queue_depth: cfg.media.max_queue_depth,
     };
     let media_manager = media::Manager::new(store.clone(), media_cfg).ok();
     let media_handle = media_manager.as_ref().map(|manager| manager.handle());
@@ -206,6 +207,10 @@ fn placeholder_post(id: &str, title: &str, description: &str) -> ui::PostPreview
             over_18: false,
             spoiler: false,
             post_hint: String::new(),
+            is_video: false,
+            media: None,
+            secure_media: None,
+            crosspost_parent_list: Vec::new(),
             preview: reddit::Preview::default(),
             gallery_data: None,
             media_metadata: None,

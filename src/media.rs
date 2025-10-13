@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -22,6 +23,7 @@ pub struct Config {
     pub default_ttl: Duration,
     pub workers: usize,
     pub http_client: Option<Client>,
+    pub max_queue_depth: usize,
 }
 
 impl Default for Config {
@@ -32,11 +34,19 @@ impl Default for Config {
             default_ttl: Duration::from_secs(6 * 60 * 60),
             workers: 2,
             http_client: None,
+            max_queue_depth: 32,
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone)]
 pub struct Request {
     pub url: String,
     pub media_type: Option<String>,
@@ -44,12 +54,28 @@ pub struct Request {
     pub height: Option<i64>,
     pub ttl: Option<Duration>,
     pub force: bool,
+    pub priority: Priority,
+}
+
+impl Default for Request {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            media_type: None,
+            width: None,
+            height: None,
+            ttl: None,
+            force: false,
+            priority: Priority::Normal,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct ResultEntry {
     pub entry: Option<MediaEntry>,
     pub error: Option<anyhow::Error>,
+    pub rejected: bool,
 }
 
 struct Job {
@@ -64,6 +90,7 @@ struct Inner {
     jobs: Sender<Job>,
     stop: Sender<()>,
     pruning: Mutex<()>,
+    queue_depth: AtomicUsize,
 }
 
 pub struct Manager {
@@ -81,6 +108,9 @@ impl Manager {
         let mut cfg = cfg;
         if cfg.workers == 0 {
             cfg.workers = 2;
+        }
+        if cfg.max_queue_depth == 0 {
+            cfg.max_queue_depth = 1;
         }
         let cache_dir = cfg
             .cache_dir
@@ -109,6 +139,7 @@ impl Manager {
             jobs: job_tx,
             stop: stop_tx,
             pruning: Mutex::new(()),
+            queue_depth: AtomicUsize::new(0),
         });
 
         let mut handles = Vec::new();
@@ -151,8 +182,28 @@ impl Drop for Manager {
 impl Handle {
     pub fn enqueue(&self, request: Request) -> Receiver<ResultEntry> {
         let (tx, rx) = unbounded();
+        if request.priority == Priority::Normal {
+            let depth = self.inner.queue_depth.load(Ordering::SeqCst);
+            if depth >= self.inner.cfg.max_queue_depth {
+                let _ = tx.send(ResultEntry {
+                    entry: None,
+                    error: None,
+                    rejected: true,
+                });
+                return rx;
+            }
+        }
+        self.inner.queue_depth.fetch_add(1, Ordering::SeqCst);
         let job = Job { request, tx };
-        let _ = self.inner.jobs.send(job);
+        if let Err(err) = self.inner.jobs.send(job) {
+            self.inner.queue_depth.fetch_sub(1, Ordering::SeqCst);
+            let job = err.0;
+            let _ = job.tx.send(ResultEntry {
+                entry: None,
+                error: Some(anyhow!("media: worker unavailable")),
+                rejected: true,
+            });
+        }
         rx
     }
 }
@@ -164,7 +215,10 @@ impl Inner {
                 recv(stop) -> _ => break,
                 recv(jobs) -> msg => {
                     match msg {
-                        Ok(job) => self.process(job),
+                        Ok(job) => {
+                            self.queue_depth.fetch_sub(1, Ordering::SeqCst);
+                            self.process(job)
+                        }
                         Err(_) => break,
                     }
                 }
@@ -177,10 +231,12 @@ impl Inner {
             Ok(entry) => ResultEntry {
                 entry: Some(entry),
                 error: None,
+                rejected: false,
             },
             Err(err) => ResultEntry {
                 entry: None,
                 error: Some(err),
+                rejected: false,
             },
         };
         let _ = job.tx.send(result);

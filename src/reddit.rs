@@ -482,6 +482,14 @@ pub struct Post {
     #[serde(default)]
     pub post_hint: String,
     #[serde(default)]
+    pub is_video: bool,
+    #[serde(default)]
+    pub media: Option<PostMedia>,
+    #[serde(default, rename = "secure_media")]
+    pub secure_media: Option<PostMedia>,
+    #[serde(default, rename = "crosspost_parent_list")]
+    pub crosspost_parent_list: Vec<CrosspostParent>,
+    #[serde(default)]
     pub preview: Preview,
     #[serde(default)]
     pub gallery_data: Option<GalleryData>,
@@ -533,6 +541,54 @@ pub struct PreviewVariant {
     pub source: PreviewSource,
     #[serde(default)]
     pub resolutions: Vec<PreviewSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostMedia {
+    #[serde(default, rename = "reddit_video")]
+    pub reddit_video: Option<RedditVideo>,
+    #[serde(default)]
+    pub oembed: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RedditVideo {
+    #[serde(default)]
+    pub fallback_url: String,
+    #[serde(default)]
+    pub dash_url: String,
+    #[serde(default)]
+    pub hls_url: String,
+    #[serde(default)]
+    pub scrubber_media_url: String,
+    #[serde(default)]
+    pub duration: i64,
+    #[serde(default)]
+    pub is_gif: bool,
+    #[serde(default)]
+    pub height: i64,
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub transcoding_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrosspostParent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub post_hint: String,
+    #[serde(default)]
+    pub media: Option<PostMedia>,
+    #[serde(default, rename = "secure_media")]
+    pub secure_media: Option<PostMedia>,
+    #[serde(default)]
+    pub preview: Preview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

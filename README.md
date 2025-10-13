@@ -10,6 +10,7 @@ Reddix - Reddit, refined for the terminal.
 ## Features
 
 - image preview based on kitty graphics protocol
+- video playback through mpv's Kitty integration
 - multi-account support
 - keyboard first navigation
 - smart caching

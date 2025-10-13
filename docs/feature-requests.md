@@ -4,7 +4,6 @@ This document tracks community requests and ideas for future Reddix releases.
 
 ## Active Requests
 
-- Inline video/GIF preview in the post pane.
 - Gallery support for multi-image posts.
 - Layout option with comments in the middle pane.
 - Compact split view for small screens.
@@ -21,6 +20,7 @@ This document tracks community requests and ideas for future Reddix releases.
 ## Completed Requests
 
 - Improved inline image handling so cramped terminals no longer overflow previews.
+- Added inline Kitty/mpv video playback embedded directly in the post content for hosted Reddit videos.
 
 ## Backlog Notes
 

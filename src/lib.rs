@@ -11,6 +11,7 @@ pub mod session;
 pub mod storage;
 pub mod ui;
 pub mod update;
+pub mod video;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

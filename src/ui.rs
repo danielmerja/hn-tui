@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
@@ -59,6 +60,7 @@ use crate::reddit;
 use crate::session;
 use crate::storage;
 use crate::update::{self, SKIP_UPDATE_ENV};
+use crate::video::{self, ExternalLaunchOptions, VideoCommand};
 
 const MAX_IMAGE_COLS: i32 = 40;
 const MAX_IMAGE_ROWS: i32 = 20;
@@ -68,8 +70,10 @@ const TARGET_PREVIEW_WIDTH_PX: i64 = 480;
 const KITTY_CHUNK_SIZE: usize = 4096;
 const MEDIA_INDENT: u16 = 0;
 const KITTY_PROBE_TIMEOUT_MS: u64 = 150;
+const VIDEO_CACHE_TTL_SECS: u64 = 60 * 60 * 12;
+const MAX_PENDING_MEDIA_REQUESTS: usize = 8;
 
-// TODO video preview
+// TODO add richer inline video controls (pause/seek/audio)
 const COLOR_BG: Color = Color::Rgb(30, 30, 46);
 const COLOR_PANEL_BG: Color = Color::Rgb(24, 24, 36);
 const COLOR_PANEL_FOCUSED_BG: Color = Color::Rgb(49, 50, 68);
@@ -87,6 +91,7 @@ const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
 const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
+const MPV_PATH_ENV: &str = "REDDIX_MPV_PATH";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
     Color::Rgb(250, 179, 135),
     Color::Rgb(166, 227, 161),
@@ -240,6 +245,8 @@ enum ActionMenuMode {
 enum ActionMenuAction {
     OpenLinks,
     SaveMedia,
+    StartVideo,
+    StopVideo,
     OpenNavigation,
     ToggleFullscreen,
 }
@@ -399,6 +406,13 @@ struct MediaPreview {
     rows: i32,
     limited_cols: bool,
     limited_rows: bool,
+    video: Option<VideoPreview>,
+}
+
+enum MediaLoadOutcome {
+    Ready(MediaPreview),
+    Absent,
+    Deferred,
 }
 
 impl MediaPreview {
@@ -425,6 +439,19 @@ impl MediaPreview {
     fn limited_rows(&self) -> bool {
         self.limited_rows
     }
+
+    fn video(&self) -> Option<&VideoPreview> {
+        self.video.as_ref()
+    }
+
+    fn has_video(&self) -> bool {
+        self.video.is_some()
+    }
+}
+
+#[derive(Clone)]
+struct VideoPreview {
+    source: video::VideoSource,
 }
 
 #[derive(Clone)]
@@ -482,6 +509,14 @@ struct MediaLayout {
     indent: u16,
 }
 
+#[derive(Clone, Copy)]
+struct MediaOrigin {
+    row: u16,
+    col: u16,
+    visual_scroll: usize,
+    visual_offset: usize,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct MediaConstraints {
     cols: i32,
@@ -526,12 +561,62 @@ fn kitty_debug_enabled() -> bool {
     *FLAG.get_or_init(|| env_truthy("REDDIX_DEBUG_KITTY"))
 }
 
+fn kitty_delete_all_sequence() -> String {
+    let base = "\x1b_Ga=d,q=0;\x1b\\";
+    if tmux_passthrough_enabled() {
+        format!("\x1bPtmux;\x1b{}\x1b\\", base)
+    } else {
+        base.to_string()
+    }
+}
+
 struct ActiveKitty {
     post_name: String,
     image_id: u32,
     wrap_tmux: bool,
     row: u16,
     col: u16,
+}
+
+struct ActiveVideo {
+    session: video::InlineSession,
+    source: video::VideoSource,
+    post_name: String,
+    row: u16,
+    col: u16,
+    cols: i32,
+    rows: i32,
+}
+
+impl ActiveVideo {
+    fn matches_geometry(
+        &self,
+        row: u16,
+        col: u16,
+        cols: i32,
+        rows: i32,
+        source: &video::VideoSource,
+    ) -> bool {
+        self.row == row
+            && self.col == col
+            && self.cols == cols
+            && self.rows == rows
+            && self.source.playback_url == source.playback_url
+    }
+
+    fn try_status(&mut self) -> Option<Result<ExitStatus>> {
+        self.session.try_status()
+    }
+}
+
+struct VideoCompletion {
+    post_name: String,
+    result: Result<ExitStatus>,
+    label: String,
+    row: u16,
+    col: u16,
+    cols: i32,
+    rows: i32,
 }
 
 struct NumericJump {
@@ -944,6 +1029,15 @@ struct PendingContent {
     cancel_flag: Arc<AtomicBool>,
 }
 
+struct PendingVideo {
+    request_id: u64,
+    post_name: String,
+    source: video::VideoSource,
+    origin: MediaOrigin,
+    dims: (i32, i32),
+    cancel_flag: Arc<AtomicBool>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadMode {
     Replace,
@@ -985,7 +1079,17 @@ enum AsyncResponse {
     },
     Media {
         post_name: String,
-        result: Result<Option<MediaPreview>>,
+        result: Result<MediaLoadOutcome>,
+    },
+    InlineVideo {
+        request_id: u64,
+        post_name: String,
+        result: Result<String>,
+    },
+    ExternalVideo {
+        request_id: u64,
+        label: String,
+        result: Result<()>,
     },
     MediaSave {
         result: Result<MediaSaveOutcome>,
@@ -1398,7 +1502,7 @@ fn make_preview(post: reddit::Post) -> PostPreview {
         } else if post.post_hint.eq_ignore_ascii_case("hosted:video")
             || post.post_hint.eq_ignore_ascii_case("rich:video")
         {
-            body.push_str("_No inline video preview available yet._\n\n");
+            body.push_str("_Inline video preview loading…_\n\n");
         } else {
             body.push_str("_No preview available for this post._\n\n");
         }
@@ -1451,58 +1555,13 @@ fn load_media_preview(
     max_cols: i32,
     max_rows: i32,
     allow_upscale: bool,
-) -> Result<Option<MediaPreview>> {
+    priority: media::Priority,
+) -> Result<MediaLoadOutcome> {
     if cancel_flag.load(Ordering::SeqCst) {
-        return Ok(None);
+        return Ok(MediaLoadOutcome::Deferred);
     }
 
     // TODO gallery support
-
-    let source = match select_preview_source(post) {
-        Some(src) => src,
-        None => return Ok(None),
-    };
-
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-
-    let url = source.url.clone();
-    if !is_supported_preview_url(&url) {
-        let fallback = indent_media_preview(&format!(
-            "[preview omitted: unsupported media — {}]",
-            image_label(&url)
-        ));
-        return Ok(Some(MediaPreview {
-            placeholder: text_from_string(fallback),
-            kitty: None,
-            cols: 0,
-            rows: 0,
-            limited_cols: false,
-            limited_rows: false,
-        }));
-    }
-
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-
-    let bytes = if let Some(handle) = media_handle {
-        match fetch_cached_media_bytes(handle, &url, source.width, source.height, cancel_flag) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(_) => fetch_image_bytes(&url)
-                .with_context(|| format!("download preview image {}", url))?,
-        }
-    } else {
-        fetch_image_bytes(&url).with_context(|| format!("download preview image {}", url))?
-    };
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    if bytes.is_empty() {
-        bail!("preview image empty");
-    }
 
     let capped_cols = if max_cols > MAX_IMAGE_COLS {
         max_cols.max(1)
@@ -1514,6 +1573,90 @@ fn load_media_preview(
     } else {
         max_rows.clamp(1, MAX_IMAGE_ROWS)
     };
+
+    if let Some(video_source) = video::find_video_source(post) {
+        let width_px = video_source.width.unwrap_or(TARGET_PREVIEW_WIDTH_PX);
+        let height_px = video_source.height.unwrap_or(((width_px * 9) / 16).max(1));
+        let (cols, rows) =
+            clamp_dimensions(width_px, height_px, capped_cols, capped_rows, allow_upscale);
+        let limited_cols = cols >= capped_cols && (width_px as i32) > capped_cols;
+        let limited_rows = rows >= capped_rows && (height_px as i32) > capped_rows;
+        let label = if video_source.label.trim().is_empty() {
+            "video"
+        } else {
+            video_source.label.trim()
+        };
+        video::debug_log(format!(
+            "resolved post={} url={} width={} height={} cols={} rows={}",
+            post.name, video_source.playback_url, width_px, height_px, cols, rows
+        ));
+        let placeholder = kitty_placeholder_text(cols, rows, MEDIA_INDENT, label);
+        return Ok(MediaLoadOutcome::Ready(MediaPreview {
+            placeholder,
+            kitty: None,
+            cols,
+            rows,
+            limited_cols,
+            limited_rows,
+            video: Some(VideoPreview {
+                source: video_source,
+            }),
+        }));
+    }
+
+    let source = match select_preview_source(post) {
+        Some(src) => src,
+        None => return Ok(MediaLoadOutcome::Absent),
+    };
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(MediaLoadOutcome::Deferred);
+    }
+
+    let url = source.url.clone();
+    if !is_supported_preview_url(&url) {
+        let fallback = indent_media_preview(&format!(
+            "[preview omitted: unsupported media — {}]",
+            image_label(&url)
+        ));
+        return Ok(MediaLoadOutcome::Ready(MediaPreview {
+            placeholder: text_from_string(fallback),
+            kitty: None,
+            cols: 0,
+            rows: 0,
+            limited_cols: false,
+            limited_rows: false,
+            video: None,
+        }));
+    }
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(MediaLoadOutcome::Deferred);
+    }
+
+    let bytes = if let Some(handle) = media_handle {
+        match fetch_cached_media_bytes(
+            handle,
+            &url,
+            source.width,
+            source.height,
+            cancel_flag,
+            priority,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(MediaLoadOutcome::Deferred),
+            Err(_) => fetch_image_bytes(&url)
+                .with_context(|| format!("download preview image {}", url))?,
+        }
+    } else {
+        fetch_image_bytes(&url).with_context(|| format!("download preview image {}", url))?
+    };
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(MediaLoadOutcome::Deferred);
+    }
+    if bytes.is_empty() {
+        bail!("preview image empty");
+    }
     let (cols, rows) = clamp_dimensions(
         source.width,
         source.height,
@@ -1530,28 +1673,30 @@ fn load_media_preview(
             "[preview omitted: viewport too small — {}]",
             label
         ));
-        return Ok(Some(MediaPreview {
+        return Ok(MediaLoadOutcome::Ready(MediaPreview {
             placeholder: text_from_string(fallback),
             kitty: None,
             cols,
             rows,
             limited_cols,
             limited_rows,
+            video: None,
         }));
     }
 
     let kitty = kitty_transmit_inline(&bytes, cols, rows, kitty_image_id(&post.name, &url))?;
     if cancel_flag.load(Ordering::SeqCst) {
-        return Ok(None);
+        return Ok(MediaLoadOutcome::Deferred);
     }
     let placeholder = kitty_placeholder_text(cols, rows, MEDIA_INDENT, &label);
-    Ok(Some(MediaPreview {
+    Ok(MediaLoadOutcome::Ready(MediaPreview {
         placeholder,
         kitty: Some(kitty),
         cols,
         rows,
         limited_cols,
         limited_rows,
+        video: None,
     }))
 }
 
@@ -1561,6 +1706,7 @@ fn fetch_cached_media_bytes(
     width: i64,
     height: i64,
     cancel_flag: &AtomicBool,
+    priority: media::Priority,
 ) -> Result<Option<Vec<u8>>> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -1570,6 +1716,7 @@ fn fetch_cached_media_bytes(
         url: url.to_string(),
         width: (width > 0).then_some(width),
         height: (height > 0).then_some(height),
+        priority,
         ..Default::default()
     };
 
@@ -1582,11 +1729,55 @@ fn fetch_cached_media_bytes(
         return Ok(None);
     }
 
+    if result.rejected {
+        return Ok(None);
+    }
+
     if let Some(entry) = result.entry {
         let path = Path::new(&entry.file_path);
         let bytes =
             fs::read(path).with_context(|| format!("read cached media {}", path.display()))?;
         Ok(Some(bytes))
+    } else if let Some(err) = result.error {
+        Err(err)
+    } else {
+        bail!("media: cache returned empty result")
+    }
+}
+
+fn fetch_cached_video_path(
+    handle: &media::Handle,
+    url: &str,
+    priority: media::Priority,
+) -> Result<PathBuf> {
+    if url.trim().is_empty() {
+        bail!("media: video url missing");
+    }
+
+    let request = media::Request {
+        url: url.to_string(),
+        media_type: Some("video/mp4".to_string()),
+        ttl: Some(Duration::from_secs(VIDEO_CACHE_TTL_SECS)),
+        priority,
+        ..Default::default()
+    };
+
+    let rx = handle.enqueue(request);
+    let result = rx
+        .recv()
+        .map_err(|err| anyhow!("media: failed to receive cache result: {}", err))?;
+
+    if result.rejected {
+        bail!("media: cache queue saturated");
+    }
+
+    if let Some(entry) = result.entry {
+        let path = PathBuf::from(entry.file_path);
+        if path.exists() {
+            Ok(path)
+        } else {
+            bail!("media: cached video missing on disk {}", path.display());
+        }
     } else if let Some(err) = result.error {
         Err(err)
     } else {
@@ -2763,10 +2954,17 @@ pub struct Model {
     media_previews: HashMap<String, MediaPreview>,
     media_failures: HashSet<String>,
     pending_media: HashMap<String, Arc<AtomicBool>>,
+    pending_media_order: VecDeque<String>,
+    pending_video: Option<PendingVideo>,
+    pending_video_clear: Option<(u16, u16, i32, i32)>,
+    pending_external_video: Option<u64>,
     media_save_in_progress: Option<MediaSaveJob>,
     media_layouts: HashMap<String, MediaLayout>,
     media_handle: Option<media::Handle>,
     media_constraints: MediaConstraints,
+    video_completed_post: Option<String>,
+    terminal_cols: u16,
+    terminal_rows: u16,
     media_fullscreen: bool,
     media_fullscreen_prev_focus: Option<Pane>,
     media_fullscreen_prev_scroll: Option<u16>,
@@ -2839,6 +3037,8 @@ pub struct Model {
     pending_posts: Option<PendingPosts>,
     pending_comments: Option<PendingComments>,
     pending_subreddits: Option<PendingSubreddits>,
+    needs_video_refresh: bool,
+    active_video: Option<ActiveVideo>,
     clipboard: Option<Clipboard>,
     kitty_status: KittyStatus,
     kitty_probe_in_progress: bool,
@@ -2963,6 +3163,7 @@ impl Model {
                 if let Some(cancel) = self.pending_media.remove(&key) {
                     cancel.store(true, Ordering::SeqCst);
                 }
+                self.remove_pending_media_tracking(&key);
                 self.media_failures.remove(&key);
                 self.media_previews.remove(&key);
                 self.ensure_media_request_ready(&post);
@@ -3270,6 +3471,7 @@ impl Model {
             flag.store(true, Ordering::SeqCst);
         }
         self.pending_media.clear();
+        self.pending_media_order.clear();
 
         self.feed_cache.clear();
         self.comment_cache.clear();
@@ -3424,8 +3626,12 @@ impl Model {
     }
     fn mark_dirty(&mut self) {
         self.needs_redraw = true;
-        if self.selected_post_has_kitty_preview() {
-            self.needs_kitty_flush = true;
+        if let Some(post) = self.posts.get(self.selected_post) {
+            if let Some(preview) = self.media_previews.get(&post.post.name) {
+                if preview.has_kitty() {
+                    self.needs_kitty_flush = true;
+                }
+            }
         }
     }
 
@@ -3464,6 +3670,7 @@ impl Model {
     }
 
     fn queue_active_kitty_delete(&mut self) {
+        self.stop_active_video(None, true);
         if let Some(sequence) = self.prepare_active_kitty_delete() {
             self.pending_kitty_deletes.push(sequence);
             self.needs_kitty_flush = true;
@@ -3495,11 +3702,20 @@ impl Model {
         backend.flush()
     }
 
-    fn selected_post_has_kitty_preview(&self) -> bool {
-        self.posts
-            .get(self.selected_post)
-            .and_then(|post| self.media_previews.get(&post.post.name))
-            .is_some_and(MediaPreview::has_kitty)
+    fn selected_post_has_inline_media(&self) -> bool {
+        let Some(post) = self.posts.get(self.selected_post) else {
+            return false;
+        };
+        let Some(preview) = self.media_previews.get(&post.post.name) else {
+            return false;
+        };
+        if preview.has_kitty() {
+            return true;
+        }
+        if !self.kitty_status.is_enabled() {
+            return false;
+        }
+        preview.has_video()
     }
 
     fn can_toggle_fullscreen_preview(&self) -> bool {
@@ -3538,6 +3754,11 @@ impl Model {
             media_previews: HashMap::new(),
             media_failures: HashSet::new(),
             pending_media: HashMap::new(),
+            pending_media_order: VecDeque::new(),
+            pending_video: None,
+            pending_video_clear: None,
+            pending_external_video: None,
+            video_completed_post: None,
             media_save_in_progress: None,
             media_layouts: HashMap::new(),
             media_handle: opts.media_handle.clone(),
@@ -3545,6 +3766,8 @@ impl Model {
                 cols: MAX_IMAGE_COLS,
                 rows: MAX_IMAGE_ROWS,
             },
+            terminal_cols: 80,
+            terminal_rows: 24,
             media_fullscreen: false,
             media_fullscreen_prev_focus: None,
             media_fullscreen_prev_scroll: None,
@@ -3617,6 +3840,8 @@ impl Model {
             pending_posts: None,
             pending_comments: None,
             pending_subreddits: None,
+            needs_video_refresh: false,
+            active_video: None,
             clipboard: None,
             kitty_status: KittyStatus::Unknown,
             kitty_probe_in_progress: false,
@@ -3689,12 +3914,13 @@ impl Model {
         terminal.clear()?;
 
         let result = self.event_loop(&mut terminal);
+        let cleanup_result = self.cleanup_inline_media(terminal.backend_mut());
 
         disable_raw_mode()?;
         terminal.backend_mut().execute(LeaveAlternateScreen)?;
         terminal.show_cursor()?;
 
-        result
+        result.and(cleanup_result)
     }
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
@@ -3702,14 +3928,25 @@ impl Model {
         let tick_rate = Duration::from_millis(120);
 
         loop {
+            self.poll_active_video();
+
             if self.poll_async() {
                 self.mark_dirty();
+            }
+
+            if self.pending_video_clear.is_some() || !self.pending_kitty_deletes.is_empty() {
+                self.flush_inline_clears(terminal.backend_mut())?;
             }
 
             if self.needs_redraw {
                 terminal.draw(|frame| self.draw(frame))?;
                 self.flush_inline_images(terminal.backend_mut())?;
                 self.needs_redraw = false;
+            }
+
+            if let Err(err) = self.refresh_inline_video() {
+                self.status_message = format!("Video preview error: {}", err);
+                self.mark_dirty();
             }
 
             let timeout = tick_rate
@@ -3807,6 +4044,18 @@ impl Model {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         let code = key.code;
+
+        if self.active_video.is_some() && matches!(code, KeyCode::Esc) {
+            let stopped = self.stop_active_video(Some("Video preview stopped."), false);
+            if stopped {
+                self.needs_video_refresh = false;
+            }
+            return Ok(false);
+        }
+
+        if self.active_video.is_some() && self.handle_video_controls(key)? {
+            return Ok(false);
+        }
 
         if self.menu_visible {
             return self.handle_menu_key(code);
@@ -4122,6 +4371,85 @@ impl Model {
         Ok(false)
     }
 
+    fn handle_video_controls(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.active_video.is_none() {
+            return Ok(false);
+        }
+
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Ok(false);
+        }
+
+        let command = match key.code {
+            KeyCode::Char(' ') | KeyCode::Char('p') | KeyCode::Char('P') => {
+                Some((VideoCommand::TogglePause, "Toggled inline video playback."))
+            }
+            KeyCode::Char('[') | KeyCode::Char('{') => Some((
+                VideoCommand::SeekRelative(-5.0),
+                "Rewound inline video 5 seconds.",
+            )),
+            KeyCode::Char(']') | KeyCode::Char('}') => Some((
+                VideoCommand::SeekRelative(5.0),
+                "Advanced inline video 5 seconds.",
+            )),
+            _ => None,
+        };
+
+        let Some((command, status)) = command else {
+            return Ok(false);
+        };
+
+        let controls_supported = self
+            .active_video
+            .as_ref()
+            .is_some_and(|active| active.session.controls_supported());
+        if !controls_supported {
+            self.status_message =
+                "Inline video controls aren’t supported on this platform.".to_string();
+            self.mark_dirty();
+            return Ok(true);
+        }
+
+        let status_text = status.to_string();
+        let result = {
+            let active = self
+                .active_video
+                .as_mut()
+                .expect("active video missing after controls_supported check");
+            active.session.send_command(command)
+        };
+
+        match result {
+            Ok(()) => {
+                self.status_message = status_text;
+                self.mark_dirty();
+            }
+            Err(err) => {
+                let control_err = err.to_string();
+                match self.restart_inline_video() {
+                    Ok(()) => {
+                        self.status_message = format!(
+                            "Inline video control failed: {}; restarted preview.",
+                            control_err
+                        );
+                    }
+                    Err(restart_err) => {
+                        self.status_message = format!(
+                            "Inline video control failed: {}; restart failed: {}",
+                            control_err, restart_err
+                        );
+                    }
+                }
+                self.mark_dirty();
+            }
+        }
+
+        Ok(true)
+    }
+
     fn handle_mouse(&mut self, event: MouseEvent) -> Result<()> {
         if self.menu_visible || self.action_menu_visible || self.help_visible {
             return Ok(());
@@ -4419,9 +4747,78 @@ impl Model {
     }
 
     fn build_action_menu_entries(&self) -> Vec<ActionMenuEntry> {
-        let links = self.collect_links_for_current_context();
         let mut entries = Vec::new();
 
+        let mut video_exists = false;
+        let mut video_ready = false;
+        let mut video_pending = false;
+        if !self.banner_selected() {
+            if let Some(post) = self.posts.get(self.selected_post) {
+                if let Some(preview) = self.media_previews.get(&post.post.name) {
+                    if preview.video().is_some() {
+                        video_exists = true;
+                        video_ready = true;
+                    }
+                } else if video::find_video_source(&post.post).is_some() {
+                    video_exists = true;
+                }
+                if self
+                    .pending_video
+                    .as_ref()
+                    .is_some_and(|pending| pending.post_name == post.post.name)
+                {
+                    video_exists = true;
+                    video_ready = false;
+                    video_pending = true;
+                }
+            }
+        }
+
+        let (video_label, video_action, video_enabled) = if !self.kitty_status.is_enabled() {
+            (
+                "Inline video (enable Kitty previews)".to_string(),
+                ActionMenuAction::StartVideo,
+                false,
+            )
+        } else if !video_exists {
+            (
+                "Inline video (not available)".to_string(),
+                ActionMenuAction::StartVideo,
+                false,
+            )
+        } else if video_pending {
+            (
+                "Inline video (preparing…)".to_string(),
+                ActionMenuAction::StartVideo,
+                false,
+            )
+        } else if !video_ready {
+            (
+                "Inline video (loading…)".to_string(),
+                ActionMenuAction::StartVideo,
+                false,
+            )
+        } else if self.active_video.is_some() {
+            (
+                "Stop inline video".to_string(),
+                ActionMenuAction::StopVideo,
+                true,
+            )
+        } else {
+            (
+                "Play inline video".to_string(),
+                ActionMenuAction::StartVideo,
+                true,
+            )
+        };
+
+        let mut video_entry = ActionMenuEntry::new(video_label, video_action);
+        if !video_enabled {
+            video_entry = video_entry.disabled();
+        }
+        entries.push(video_entry);
+
+        let links = self.collect_links_for_current_context();
         let links_label = if links.is_empty() {
             "Open links… (none available)".to_string()
         } else {
@@ -4901,6 +5298,32 @@ impl Model {
                                     self.action_menu_selected =
                                         self.action_menu_items.len().saturating_sub(1);
                                 }
+                            }
+                            ActionMenuAction::StartVideo => {
+                                self.needs_video_refresh = true;
+                                match self.restart_inline_video() {
+                                    Ok(()) => {
+                                        self.close_action_menu(None);
+                                        return Ok(false);
+                                    }
+                                    Err(err) => {
+                                        self.status_message =
+                                            format!("Unable to start inline video: {}", err);
+                                        self.mark_dirty();
+                                    }
+                                }
+                            }
+                            ActionMenuAction::StopVideo => {
+                                if self.stop_active_video(Some("Video preview stopped."), false) {
+                                    self.needs_video_refresh = false;
+                                }
+                                self.action_menu_items = self.build_action_menu_entries();
+                                if self.action_menu_selected >= self.action_menu_items.len() {
+                                    self.action_menu_selected =
+                                        self.action_menu_items.len().saturating_sub(1);
+                                }
+                                self.close_action_menu(None);
+                                return Ok(false);
                             }
                             ActionMenuAction::ToggleFullscreen => {
                                 let was_fullscreen = self.media_fullscreen;
@@ -5548,6 +5971,12 @@ impl Model {
                 vec![
                     ("y", "Copy the highlighted comment"),
                     ("f", "Toggle fullscreen media preview"),
+                    ("space / p (video)", "Pause or resume inline playback"),
+                    (
+                        "[ / ] (video)",
+                        "Seek inline video backward/forward 5 seconds",
+                    ),
+                    ("Esc (during video)", "Stop inline video playback"),
                     ("U", "Run the available updater"),
                     ("q / Esc", "Quit Reddix"),
                 ],
@@ -6052,22 +6481,38 @@ impl Model {
             }
             AsyncResponse::Media { post_name, result } => {
                 self.pending_media.remove(&post_name);
+                self.remove_pending_media_tracking(&post_name);
                 let relevant = self.posts.iter().any(|post| post.post.name == post_name);
                 if !relevant {
                     return;
                 }
                 match result {
-                    Ok(Some(preview)) => {
+                    Ok(MediaLoadOutcome::Ready(preview)) => {
+                        let has_video = preview.video().is_some();
                         self.media_failures.remove(&post_name);
                         self.media_previews.insert(post_name.clone(), preview);
+                        if has_video && self.active_video.is_some() {
+                            self.needs_video_refresh = true;
+                        }
                     }
-                    Ok(None) => {
+                    Ok(MediaLoadOutcome::Absent) => {
                         self.media_failures.insert(post_name.clone());
                         self.media_previews.remove(&post_name);
+                        if self.active_video.is_some() {
+                            let _ = self.stop_active_video(None, true);
+                        }
+                    }
+                    Ok(MediaLoadOutcome::Deferred) => {
+                        if self.active_video.is_some() {
+                            let _ = self.stop_active_video(None, true);
+                        }
                     }
                     Err(err) => {
                         self.media_failures.insert(post_name.clone());
                         self.media_previews.remove(&post_name);
+                        if self.active_video.is_some() {
+                            let _ = self.stop_active_video(None, true);
+                        }
                         self.status_message = format!("Image preview failed: {}", err);
                     }
                 }
@@ -6078,6 +6523,102 @@ impl Model {
                     .map(|post| post.post.name.as_str());
                 if current == Some(post_name.as_str()) {
                     self.sync_content_from_selection();
+                }
+                self.mark_dirty();
+            }
+            AsyncResponse::InlineVideo {
+                request_id,
+                post_name,
+                result,
+            } => {
+                let Some(pending) = self.pending_video.as_ref() else {
+                    return;
+                };
+                if pending.request_id != request_id || pending.post_name != post_name {
+                    return;
+                }
+                if pending.cancel_flag.load(Ordering::SeqCst) {
+                    self.pending_video = None;
+                    return;
+                }
+                let current = self
+                    .posts
+                    .get(self.selected_post)
+                    .map(|post| post.post.name.as_str());
+                if current != Some(post_name.as_str()) {
+                    self.pending_video = None;
+                    return;
+                }
+                let pending = self.pending_video.take().unwrap();
+                let PendingVideo {
+                    source,
+                    origin,
+                    dims,
+                    ..
+                } = pending;
+                match result {
+                    Ok(path) => {
+                        video::debug_log(format!(
+                            "video cache hit url={} path={}",
+                            source.playback_url, path
+                        ));
+                        if let Err(err) = self.launch_inline_video(
+                            post_name.clone(),
+                            origin,
+                            source,
+                            dims,
+                            path.clone(),
+                            false,
+                        ) {
+                            self.status_message = format!("Failed to start video preview: {}", err);
+                            self.mark_dirty();
+                        }
+                    }
+                    Err(err) => {
+                        let playback_url = source.playback_url.clone();
+                        video::debug_log(format!(
+                            "video cache fetch failed for {}: {}",
+                            playback_url, err
+                        ));
+                        if let Err(play_err) = self.launch_inline_video(
+                            post_name.clone(),
+                            origin,
+                            source,
+                            dims,
+                            playback_url.clone(),
+                            true,
+                        ) {
+                            self.status_message =
+                                format!("Failed to start video preview: {}", play_err);
+                            self.mark_dirty();
+                        } else {
+                            self.status_message
+                                .push_str(" Cache unavailable; streaming directly.");
+                            self.mark_dirty();
+                        }
+                    }
+                }
+            }
+            AsyncResponse::ExternalVideo {
+                request_id,
+                label,
+                result,
+            } => {
+                if self.pending_external_video != Some(request_id) {
+                    return;
+                }
+                self.pending_external_video = None;
+                match result {
+                    Ok(()) => {
+                        self.status_message =
+                            format!("Launched fullscreen player for \"{}\".", label);
+                    }
+                    Err(err) => {
+                        self.status_message = format!(
+                            "Failed to launch fullscreen player for \"{}\": {}",
+                            label, err
+                        );
+                    }
                 }
                 self.mark_dirty();
             }
@@ -6386,7 +6927,7 @@ impl Model {
                     let magnitude = (-delta) as u16;
                     self.content_scroll = self.content_scroll.saturating_sub(magnitude);
                 }
-                if self.selected_post_has_kitty_preview() {
+                if self.selected_post_has_inline_media() {
                     self.needs_kitty_flush = true;
                 }
             }
@@ -6760,6 +7301,8 @@ impl Model {
             self.comment_offset.set(0);
             self.close_action_menu(None);
             self.comment_sort_selected = false;
+            let _ = self.stop_active_video(None, true);
+            self.video_completed_post = None;
             self.sync_content_from_selection();
             if let Err(err) = self.load_comments_for_selection() {
                 self.comment_status = format!("Failed to load comments: {err}");
@@ -7352,6 +7895,8 @@ impl Model {
                     }
                     keep
                 });
+                self.pending_media_order
+                    .retain(|key| self.pending_media.contains_key(key));
                 self.comment_cache.retain(|key, _| {
                     self.posts
                         .iter()
@@ -7495,6 +8040,7 @@ impl Model {
                 flag.store(true, Ordering::SeqCst);
             }
             self.pending_media.clear();
+            self.pending_media_order.clear();
             self.needs_kitty_flush = false;
             self.content_area = None;
             return Ok(());
@@ -7819,6 +8365,7 @@ impl Model {
 
     fn toggle_media_fullscreen(&mut self) -> Result<()> {
         if self.media_fullscreen {
+            let _ = self.stop_active_video(None, true);
             let previous_focus = self.media_fullscreen_prev_focus.take();
             let previous_scroll = self.media_fullscreen_prev_scroll.take();
             self.media_fullscreen = false;
@@ -7836,8 +8383,35 @@ impl Model {
                     .min(u16::MAX as usize) as u16;
                 self.content_scroll = scroll.min(max_scroll);
             }
+            self.pending_external_video = None;
             self.status_message = "Fullscreen preview closed.".to_string();
             self.mark_dirty();
+            return Ok(());
+        }
+
+        let inline_video_source = self
+            .active_video
+            .as_ref()
+            .map(|active| active.source.clone());
+        let _ = self.stop_active_video(None, true);
+
+        let Some(post) = self.posts.get(self.selected_post).cloned() else {
+            self.status_message =
+                "Select a post with media before toggling fullscreen.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        let video_source = inline_video_source
+            .or_else(|| {
+                self.media_previews
+                    .get(&post.post.name)
+                    .and_then(|preview| preview.video().map(|video| video.source.clone()))
+            })
+            .or_else(|| video::find_video_source(&post.post));
+
+        if let Some(source) = video_source {
+            self.launch_external_video(source);
             return Ok(());
         }
 
@@ -7852,13 +8426,6 @@ impl Model {
             self.mark_dirty();
             return Ok(());
         }
-
-        let Some(post) = self.posts.get(self.selected_post).cloned() else {
-            self.status_message =
-                "Select a post with media before toggling fullscreen.".to_string();
-            self.mark_dirty();
-            return Ok(());
-        };
 
         if select_preview_source(&post.post).is_none() {
             self.status_message = "This post has no inline preview.".to_string();
@@ -7877,6 +8444,7 @@ impl Model {
         if let Some(cancel) = self.pending_media.remove(&key) {
             cancel.store(true, Ordering::SeqCst);
         }
+        self.remove_pending_media_tracking(&key);
         if self
             .media_previews
             .get(&key)
@@ -7906,6 +8474,41 @@ impl Model {
         self.request_media_preview_with_limits(post, max_cols, max_rows, false);
     }
 
+    fn trim_pending_media_queue(&mut self, protected: &str) {
+        if self.pending_media.len() < MAX_PENDING_MEDIA_REQUESTS {
+            return;
+        }
+        let selected = self
+            .posts
+            .get(self.selected_post)
+            .map(|post| post.post.name.clone());
+        let mut skipped: Vec<String> = Vec::new();
+
+        while self.pending_media.len() >= MAX_PENDING_MEDIA_REQUESTS {
+            let Some(candidate) = self.pending_media_order.pop_front() else {
+                break;
+            };
+            if candidate == protected || selected.as_ref().is_some_and(|name| name == &candidate) {
+                skipped.push(candidate);
+                if skipped.len() >= self.pending_media.len() {
+                    break;
+                }
+                continue;
+            }
+            if let Some(flag) = self.pending_media.remove(&candidate) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for key in skipped {
+            self.pending_media_order.push_back(key);
+        }
+    }
+
+    fn remove_pending_media_tracking(&mut self, key: &str) {
+        self.pending_media_order.retain(|entry| entry != key);
+    }
+
     fn request_media_preview_with_limits(
         &mut self,
         post: &reddit::Post,
@@ -7918,8 +8521,21 @@ impl Model {
             return;
         }
 
+        self.trim_pending_media_queue(&key);
+
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.pending_media.insert(key.clone(), cancel_flag.clone());
+        self.pending_media_order.push_back(key.clone());
+
+        let selected_name = self
+            .posts
+            .get(self.selected_post)
+            .map(|post| post.post.name.clone());
+        let priority = if selected_name.as_ref().is_some_and(|name| name == &key) {
+            media::Priority::High
+        } else {
+            media::Priority::Normal
+        };
         let tx = self.response_tx.clone();
         let post_clone = post.clone();
         let media_handle = self.media_handle.clone();
@@ -7936,6 +8552,7 @@ impl Model {
                 max_cols,
                 max_rows,
                 allow_upscale,
+                priority,
             );
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
@@ -7975,6 +8592,9 @@ impl Model {
         let new_constraints = MediaConstraints { cols, rows };
         if new_constraints != self.media_constraints {
             self.media_constraints = new_constraints;
+            if self.active_video.is_some() {
+                self.needs_video_refresh = true;
+            }
             true
         } else {
             false
@@ -8116,6 +8736,8 @@ impl Model {
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let full = frame.size();
+        self.terminal_cols = full.width.max(1);
+        self.terminal_rows = full.height.max(1);
         frame.render_widget(Block::default().style(Style::default().bg(COLOR_BG)), full);
 
         if self.media_fullscreen {
@@ -8197,9 +8819,53 @@ impl Model {
         }
     }
 
-    fn flush_inline_images(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
+    fn resolve_media_origin(&self, layout: MediaLayout) -> Option<MediaOrigin> {
+        let area = self.content_area?;
+        let content_width = area.width.saturating_sub(layout.indent).max(1);
+        let lines = &self.content.lines;
+        let line_offset = layout.line_offset.min(lines.len());
+        let scroll_lines = self.content_scroll as usize;
+        let visual_offset = visual_height(&lines[..line_offset], content_width);
+        let visual_scroll = visual_height(&lines[..scroll_lines.min(lines.len())], content_width);
+
+        if visual_offset < visual_scroll {
+            return None;
+        }
+
+        let relative_row = visual_offset - visual_scroll;
+        if relative_row >= area.height as usize {
+            return None;
+        }
+
+        Some(MediaOrigin {
+            row: area.y + relative_row as u16,
+            col: area.x.saturating_add(layout.indent),
+            visual_scroll,
+            visual_offset,
+        })
+    }
+
+    fn flush_inline_clears(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
         self.flush_pending_kitty_deletes(backend)?;
 
+        if let Some((_row, _col, _cols, _rows)) = self.pending_video_clear.take() {
+            let delete_seq = kitty_delete_all_sequence();
+            crossterm::queue!(backend, Print(delete_seq))?;
+            for preview in self.media_previews.values_mut() {
+                if let Some(kitty) = preview.kitty_mut() {
+                    kitty.transmitted = false;
+                }
+            }
+            self.active_kitty = None;
+            self.needs_kitty_flush = true;
+            backend.flush()?;
+            self.needs_redraw = true;
+        }
+
+        Ok(())
+    }
+
+    fn flush_inline_images(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
         if self.action_menu_visible || self.menu_visible || self.help_visible {
             self.needs_kitty_flush = true;
             self.emit_active_kitty_delete(backend)?;
@@ -8214,10 +8880,12 @@ impl Model {
         let mut requested_redraw = false;
 
         let Some(area) = self.content_area else {
+            let _ = self.stop_active_video(None, true);
             self.emit_active_kitty_delete(backend)?;
             return Ok(());
         };
         let Some(post) = self.posts.get(self.selected_post) else {
+            let _ = self.stop_active_video(None, true);
             self.emit_active_kitty_delete(backend)?;
             return Ok(());
         };
@@ -8234,38 +8902,28 @@ impl Model {
             if self.active_kitty_matches(&post_name) {
                 self.emit_active_kitty_delete(backend)?;
             }
+            let _ = self.stop_active_video(None, true);
             return Ok(());
         }
         let Some(layout) = self.media_layouts.get(&post_name).copied() else {
             if self.active_kitty_matches(&post_name) {
                 self.emit_active_kitty_delete(backend)?;
             }
+            let _ = self.stop_active_video(None, true);
             return Ok(());
         };
 
-        let content_width = area.width.saturating_sub(layout.indent).max(1);
-        let lines = &self.content.lines;
-        let line_offset = layout.line_offset.min(lines.len());
-        let scroll_lines = self.content_scroll as usize;
-        let visual_offset = visual_height(&lines[..line_offset], content_width);
-        let visual_scroll = visual_height(&lines[..scroll_lines.min(lines.len())], content_width);
+        let active_matches = self.active_kitty_matches(&post_name);
 
-        if visual_offset < visual_scroll {
-            if self.active_kitty_matches(&post_name) {
+        let Some(origin) = self.resolve_media_origin(layout) else {
+            if active_matches {
                 self.emit_active_kitty_delete(backend)?;
             }
             return Ok(());
-        }
-        let relative_row = visual_offset - visual_scroll;
-        if relative_row >= area.height as usize {
-            if self.active_kitty_matches(&post_name) {
-                self.emit_active_kitty_delete(backend)?;
-            }
-            return Ok(());
-        }
+        };
 
-        let row = area.y + relative_row as u16;
-        let col = area.x.saturating_add(layout.indent);
+        let row = origin.row;
+        let col = origin.col;
 
         if self.active_kitty.as_ref().is_some_and(|active| {
             active.post_name == post_name && (active.row != row || active.col != col)
@@ -8273,16 +8931,37 @@ impl Model {
             self.emit_active_kitty_delete(backend)?;
         }
 
+        if let Some(preview_ref) = self.media_previews.get(&post_name) {
+            if preview_ref.has_video() {
+                if active_matches {
+                    self.emit_active_kitty_delete(backend)?;
+                }
+                if self.active_video.is_none() {
+                    self.needs_video_refresh = true;
+                }
+                return Ok(());
+            }
+            if !preview_ref.has_kitty() {
+                if active_matches {
+                    self.emit_active_kitty_delete(backend)?;
+                }
+                let _ = self.stop_active_video(None, true);
+                return Ok(());
+            }
+        }
+
         let Some(preview) = self.media_previews.get_mut(&post_name) else {
-            if self.active_kitty_matches(&post_name) {
+            if active_matches {
                 self.emit_active_kitty_delete(backend)?;
             }
+            let _ = self.stop_active_video(None, true);
             return Ok(());
         };
         let Some(kitty) = preview.kitty_mut() else {
-            if self.active_kitty_matches(&post_name) {
+            if active_matches {
                 self.emit_active_kitty_delete(backend)?;
             }
+            let _ = self.stop_active_video(None, true);
             return Ok(());
         };
 
@@ -8298,8 +8977,8 @@ impl Model {
                 area.y,
                 area.width,
                 area.height,
-                visual_scroll,
-                visual_offset,
+                origin.visual_scroll,
+                origin.visual_offset,
                 layout.indent,
                 self.content_scroll
             );
@@ -8328,6 +9007,448 @@ impl Model {
         }
 
         Ok(())
+    }
+
+    fn cleanup_inline_media(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
+        if let Some(pending) = self.pending_posts.take() {
+            pending.cancel_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(pending) = self.pending_comments.take() {
+            pending.cancel_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(pending) = self.pending_content.take() {
+            pending.cancel_flag.store(true, Ordering::SeqCst);
+        }
+        self.pending_post_rows = None;
+        self.pending_subreddits = None;
+        self.cancel_pending_video();
+        let _ = self.stop_active_video(None, true);
+        for flag in self.pending_media.values() {
+            flag.store(true, Ordering::SeqCst);
+        }
+        self.pending_media.clear();
+        self.pending_media_order.clear();
+        self.flush_inline_clears(backend)?;
+        self.emit_active_kitty_delete(backend)
+            .context("cleanup inline media: emit active kitty delete")?;
+        self.flush_pending_kitty_deletes(backend)
+            .context("cleanup inline media: flush pending kitty deletes")?;
+        let delete_seq = kitty_delete_all_sequence();
+        crossterm::queue!(backend, Print(delete_seq))
+            .context("cleanup inline media: queue global delete")?;
+        backend
+            .flush()
+            .context("cleanup inline media: flush terminal backend")?;
+        self.pending_video_clear = None;
+        self.pending_kitty_deletes.clear();
+        self.needs_kitty_flush = false;
+        self.active_kitty = None;
+        self.pending_video = None;
+        self.pending_external_video = None;
+        Ok(())
+    }
+
+    fn cancel_pending_video(&mut self) {
+        if let Some(pending) = self.pending_video.take() {
+            pending.cancel_flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_video_matches(
+        &self,
+        post_name: &str,
+        origin: MediaOrigin,
+        dims: (i32, i32),
+        source: &video::VideoSource,
+    ) -> bool {
+        self.pending_video.as_ref().is_some_and(|pending| {
+            pending.post_name == post_name
+                && pending.origin.row == origin.row
+                && pending.origin.col == origin.col
+                && pending.dims == dims
+                && pending.source.playback_url == source.playback_url
+        })
+    }
+
+    fn launch_inline_video(
+        &mut self,
+        post_name: String,
+        origin: MediaOrigin,
+        source: video::VideoSource,
+        dims: (i32, i32),
+        playback: String,
+        streaming: bool,
+    ) -> Result<()> {
+        let mpv_path = env::var(MPV_PATH_ENV).unwrap_or_else(|_| "mpv".to_string());
+        let term_cols = i32::from(self.terminal_cols.max(1));
+        let term_rows = i32::from(self.terminal_rows.max(1));
+        let metrics = terminal_cell_metrics();
+        let cell_width = metrics.width.max(1.0);
+        let cell_height = metrics.height.max(1.0);
+        let preview_cols = dims.0.max(1);
+        let preview_rows = dims.1.max(1);
+        let pixel_width = ((preview_cols as f64) * cell_width).round() as i32;
+        let pixel_height = ((preview_rows as f64) * cell_height).round() as i32;
+        let launch = video::InlineLaunchOptions {
+            mpv_path: &mpv_path,
+            source: &source,
+            playback: Cow::Owned(playback),
+            cols: preview_cols,
+            rows: preview_rows,
+            col: origin.col,
+            row: origin.row,
+            term_cols,
+            term_rows,
+            pixel_width,
+            pixel_height,
+        };
+
+        let session = video::spawn_inline_player(launch)?;
+        let controls_supported = session.controls_supported();
+        self.active_video = Some(ActiveVideo {
+            session,
+            source,
+            post_name,
+            row: origin.row,
+            col: origin.col,
+            cols: dims.0.max(1),
+            rows: dims.1.max(1),
+        });
+        video::debug_log(format!(
+            "inline launch row={} col={} cols={} rows={}",
+            origin.row, origin.col, dims.0, dims.1
+        ));
+        self.pending_video = None;
+        self.needs_video_refresh = false;
+        let controls_hint = if controls_supported {
+            "space/p pause · [ ] seek ±5s · Esc stop"
+        } else {
+            "Esc stop (inline controls unavailable on this platform)"
+        };
+        self.status_message = if streaming {
+            format!("Streaming inline video preview — {}.", controls_hint)
+        } else {
+            format!("Playing inline video preview — {}.", controls_hint)
+        };
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn start_inline_video(
+        &mut self,
+        post_name: String,
+        origin: MediaOrigin,
+        source: video::VideoSource,
+        dims: (i32, i32),
+    ) -> Result<()> {
+        self.cancel_pending_video();
+        self.video_completed_post = None;
+        let display_label = if source.label.trim().is_empty() {
+            "video".to_string()
+        } else {
+            source.label.trim().to_string()
+        };
+        if let Some(handle) = self.media_handle.clone() {
+            let playback_url = source.playback_url.clone();
+            let request_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.saturating_add(1);
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            self.pending_video = Some(PendingVideo {
+                request_id,
+                post_name: post_name.clone(),
+                source,
+                origin,
+                dims,
+                cancel_flag: cancel_flag.clone(),
+            });
+            self.status_message = format!("Downloading video preview for \"{}\"…", display_label);
+            self.needs_video_refresh = false;
+            self.mark_dirty();
+            let tx = self.response_tx.clone();
+            thread::spawn(move || {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let result = fetch_cached_video_path(&handle, &playback_url, media::Priority::High)
+                    .map(|path| path.to_string_lossy().to_string());
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let _ = tx.send(AsyncResponse::InlineVideo {
+                    request_id,
+                    post_name,
+                    result,
+                });
+            });
+            return Ok(());
+        }
+
+        let playback = source.playback_url.clone();
+        self.launch_inline_video(post_name, origin, source, dims, playback, true)
+    }
+
+    fn launch_external_video(&mut self, source: video::VideoSource) {
+        let label = if source.label.trim().is_empty() {
+            "video".to_string()
+        } else {
+            source.label.trim().to_string()
+        };
+        let mpv_path = env::var(MPV_PATH_ENV).unwrap_or_else(|_| "mpv".to_string());
+        let playback_url = source.playback_url.clone();
+        let handle = self.media_handle.clone();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.pending_external_video = Some(request_id);
+        self.status_message = format!("Launching fullscreen player for \"{}\"…", label);
+        self.mark_dirty();
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let mut playback_target = playback_url.clone();
+            if let Some(handle) = handle.as_ref() {
+                match fetch_cached_video_path(handle, &playback_url, media::Priority::High) {
+                    Ok(path) => {
+                        playback_target = path.to_string_lossy().to_string();
+                        video::debug_log(format!(
+                            "external video cache hit url={} path={}",
+                            playback_url,
+                            path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        video::debug_log(format!(
+                            "external video cache fetch failed for {}: {}",
+                            playback_url, err
+                        ));
+                    }
+                }
+            }
+            let mut result = video::spawn_external_player(ExternalLaunchOptions {
+                mpv_path: &mpv_path,
+                source: &source,
+                playback: &playback_target,
+                fullscreen: true,
+            });
+            if result.is_err() && playback_target != playback_url {
+                video::debug_log(format!(
+                    "retrying external video launch with remote url {}",
+                    playback_url
+                ));
+                result = video::spawn_external_player(ExternalLaunchOptions {
+                    mpv_path: &mpv_path,
+                    source: &source,
+                    playback: &playback_url,
+                    fullscreen: true,
+                });
+            }
+            let _ = tx.send(AsyncResponse::ExternalVideo {
+                request_id,
+                label,
+                result,
+            });
+        });
+    }
+
+    fn stop_active_video(&mut self, message: Option<&str>, silent: bool) -> bool {
+        self.cancel_pending_video();
+        if let Some(active) = self.active_video.take() {
+            let ActiveVideo {
+                session,
+                source,
+                post_name,
+                row,
+                col,
+                cols,
+                rows,
+            } = active;
+
+            self.pending_video_clear = Some((row, col, cols, rows));
+            self.video_completed_post = Some(post_name);
+
+            let outcome = session.stop_blocking();
+
+            if !silent {
+                if let Some(msg) = message {
+                    self.status_message = msg.to_string();
+                } else if let Some(result) = outcome {
+                    self.status_message = match result {
+                        Ok(status) => {
+                            if status.success() {
+                                if source.label.trim().is_empty() {
+                                    "Video playback finished.".to_string()
+                                } else {
+                                    format!("Finished playing \"{}\".", source.label.trim())
+                                }
+                            } else if let Some(code) = status.code() {
+                                format!("Video playback ended with status {}.", code)
+                            } else {
+                                "Video playback ended unexpectedly.".to_string()
+                            }
+                        }
+                        Err(err) => format!("Video playback error: {}", err),
+                    };
+                }
+            } else if let Some(msg) = message {
+                self.status_message = msg.to_string();
+            }
+
+            self.needs_video_refresh = false;
+            self.needs_kitty_flush = true;
+            self.mark_dirty();
+            true
+        } else {
+            if !silent {
+                if let Some(msg) = message {
+                    self.status_message = msg.to_string();
+                }
+            }
+            false
+        }
+    }
+
+    fn poll_active_video(&mut self) {
+        let mut finished: Option<VideoCompletion> = None;
+        if let Some(active) = self.active_video.as_mut() {
+            if let Some(result) = active.try_status() {
+                finished = Some(VideoCompletion {
+                    post_name: active.post_name.clone(),
+                    result,
+                    label: active.source.label.clone(),
+                    row: active.row,
+                    col: active.col,
+                    cols: active.cols,
+                    rows: active.rows,
+                });
+            }
+        }
+
+        if let Some(VideoCompletion {
+            post_name,
+            result,
+            label,
+            row,
+            col,
+            cols,
+            rows,
+        }) = finished
+        {
+            self.active_video = None;
+            self.pending_video_clear = Some((row, col, cols, rows));
+            self.status_message = match result {
+                Ok(status) => {
+                    if status.success() {
+                        if label.trim().is_empty() {
+                            "Video playback finished.".to_string()
+                        } else {
+                            format!("Finished playing \"{}\".", label.trim())
+                        }
+                    } else if let Some(code) = status.code() {
+                        format!("Video playback ended with status {}.", code)
+                    } else {
+                        "Video playback ended unexpectedly.".to_string()
+                    }
+                }
+                Err(err) => format!("Video playback error: {}", err),
+            };
+            self.needs_video_refresh = false;
+            self.needs_kitty_flush = true;
+            self.video_completed_post = Some(post_name);
+            self.mark_dirty();
+        }
+    }
+
+    fn refresh_inline_video(&mut self) -> Result<()> {
+        if !self.kitty_status.is_enabled() {
+            let _ = self.stop_active_video(
+                Some("Inline video requires Kitty previews; playback stopped."),
+                false,
+            );
+            self.needs_video_refresh = false;
+            return Ok(());
+        }
+
+        if self.action_menu_visible
+            || self.menu_visible
+            || self.help_visible
+            || self.media_fullscreen
+        {
+            let _ = self.stop_active_video(None, true);
+            self.needs_video_refresh = true;
+            return Ok(());
+        }
+
+        if !self.needs_video_refresh && self.active_video.is_some() {
+            return Ok(());
+        }
+
+        let (post_name, dims, video_source, origin) = {
+            let Some(post) = self.posts.get(self.selected_post) else {
+                let _ = self.stop_active_video(None, true);
+                self.needs_video_refresh = true;
+                return Ok(());
+            };
+            let preview_ref = match self.media_previews.get(&post.post.name) {
+                Some(preview) => preview,
+                None => {
+                    let _ = self.stop_active_video(None, true);
+                    self.needs_video_refresh = true;
+                    return Ok(());
+                }
+            };
+            let (dims, video_source) = match preview_ref.video() {
+                Some(video_preview) => (preview_ref.dims(), video_preview.source.clone()),
+                None => {
+                    let _ = self.stop_active_video(None, true);
+                    self.needs_video_refresh = false;
+                    return Ok(());
+                }
+            };
+            let Some(layout) = self.media_layouts.get(&post.post.name).copied() else {
+                let _ = self.stop_active_video(None, true);
+                self.needs_video_refresh = true;
+                return Ok(());
+            };
+            let Some(origin) = self.resolve_media_origin(layout) else {
+                let _ = self.stop_active_video(None, true);
+                self.needs_video_refresh = true;
+                return Ok(());
+            };
+            (post.post.name.clone(), dims, video_source, origin)
+        };
+
+        if let Some(active) = &self.active_video {
+            if active.matches_geometry(origin.row, origin.col, dims.0, dims.1, &video_source) {
+                self.needs_video_refresh = false;
+                return Ok(());
+            }
+        }
+
+        if self.pending_video_matches(&post_name, origin, dims, &video_source) {
+            self.needs_video_refresh = false;
+            return Ok(());
+        }
+
+        if !self.needs_video_refresh
+            && self
+                .video_completed_post
+                .as_deref()
+                .is_some_and(|completed| completed == post_name)
+        {
+            return Ok(());
+        }
+
+        let _ = self.stop_active_video(None, true);
+        if let Err(err) = self.start_inline_video(post_name.clone(), origin, video_source, dims) {
+            self.status_message = format!("Failed to start video preview: {}", err);
+            self.needs_video_refresh = false;
+            self.mark_dirty();
+        }
+        Ok(())
+    }
+
+    fn restart_inline_video(&mut self) -> Result<()> {
+        self.stop_active_video(None, true);
+        self.needs_video_refresh = true;
+        self.refresh_inline_video()
     }
 
     fn pane_block(&self, pane: Pane) -> Block<'static> {
@@ -8911,6 +10032,7 @@ impl Model {
                 if let Some(flag) = self.pending_media.remove(&key) {
                     flag.store(true, Ordering::SeqCst);
                 }
+                self.remove_pending_media_tracking(&key);
                 self.media_previews.remove(&key);
                 self.media_failures.remove(&key);
                 self.queue_active_kitty_delete();
@@ -8946,6 +10068,9 @@ impl Model {
                 );
                 if preview.has_kitty() {
                     self.needs_kitty_flush = true;
+                }
+                if preview.video().is_some() && self.active_video.is_some() {
+                    self.needs_video_refresh = true;
                 }
             }
         } else if !self.media_failures.contains(&key) {
@@ -8994,6 +10119,17 @@ impl Model {
         let available_rows = self.media_constraints.rows.max(1);
 
         if let Some(preview) = self.media_previews.get(&key).cloned() {
+            if preview.video().is_some() {
+                let _ = self.stop_active_video(None, true);
+                return Text::from(vec![
+                    Line::from(Span::styled(
+                        "Video playback runs in the inline view. Press f to return.",
+                        Style::default().fg(COLOR_TEXT_SECONDARY),
+                    )),
+                    Line::default(),
+                    self.fullscreen_hint_line(),
+                ]);
+            }
             let (cols, rows) = preview.dims();
             let expand_cols = preview.limited_cols() && max_cols > cols;
             let expand_rows = preview.limited_rows() && max_rows > rows;
@@ -9002,6 +10138,7 @@ impl Model {
                 if let Some(cancel) = self.pending_media.remove(&key) {
                     cancel.store(true, Ordering::SeqCst);
                 }
+                self.remove_pending_media_tracking(&key);
                 self.media_previews.remove(&key);
                 self.media_failures.remove(&key);
                 self.request_media_preview_with_limits(&post.post, max_cols, max_rows, true);
@@ -9149,7 +10286,7 @@ impl Model {
             if constraints_changed {
                 self.refresh_selected_post_media();
             }
-            if self.selected_post_has_kitty_preview() {
+            if self.selected_post_has_inline_media() {
                 self.needs_kitty_flush = true;
             }
             let paragraph = Paragraph::new(self.content.clone())
@@ -9165,7 +10302,7 @@ impl Model {
             if constraints_changed {
                 self.refresh_selected_post_media();
             }
-            if self.selected_post_has_kitty_preview() {
+            if self.selected_post_has_inline_media() {
                 self.needs_kitty_flush = true;
             }
             let paragraph = Paragraph::new(self.content.clone())
@@ -9849,6 +10986,10 @@ impl Model {
 
         if self.pending_posts.is_some() {
             parts.push("Refreshing feed…".to_string());
+        }
+
+        if self.active_video.is_some() {
+            parts.push("Video: q stop playback".to_string());
         }
 
         parts.push("h/l focus panes".to_string());
