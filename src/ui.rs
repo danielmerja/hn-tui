@@ -661,6 +661,7 @@ fn collect_comments(
             body: clean_body,
             score: comment.score,
             likes: comment.likes,
+            score_hidden: comment.score_hidden,
             depth,
             descendant_count: 0,
             links: link_entries,
@@ -974,6 +975,7 @@ struct CommentEntry {
     body: String,
     score: i64,
     likes: Option<bool>,
+    score_hidden: bool,
     depth: usize,
     descendant_count: usize,
     links: Vec<LinkEntry>,
@@ -1150,8 +1152,12 @@ fn comment_lines(
         None => "·",
     };
 
-    let score = comment.score;
-    let mut header = format!("{vote_marker} u/{author} · {score} points");
+    let mut header = if comment.score_hidden {
+        format!("{vote_marker} u/{author} · score hidden")
+    } else {
+        let score = comment.score;
+        format!("{vote_marker} u/{author} · {score} points")
+    };
     if collapsed {
         let hidden = comment.descendant_count;
         if hidden > 0 {
@@ -6897,6 +6903,7 @@ impl Model {
                             } else {
                                 self.status_message =
                                     format!("{} comment by u/{}.", action_word.0, comment.author);
+                                comment.score_hidden = false;
                             }
                             cache_update = Some((index, comment.score, comment.likes));
                             self.ensure_comment_visible();
@@ -6913,6 +6920,7 @@ impl Model {
                                     if let Some(entry) = cache.comments.get_mut(index) {
                                         entry.score = score;
                                         entry.likes = likes;
+                                        entry.score_hidden = false;
                                     }
                                     cache.fetched_at = Instant::now();
                                 }
@@ -7142,6 +7150,7 @@ impl Model {
                 entry.score += (new_vote - old_vote) as i64;
             }
             entry.likes = likes_from_vote(new_vote);
+            entry.score_hidden = false;
             updated_comment = Some((entry.score, entry.likes));
         }
 
@@ -7156,6 +7165,7 @@ impl Model {
                     if let Some(entry) = cache.comments.get_mut(comment_index) {
                         entry.score = score;
                         entry.likes = likes;
+                        entry.score_hidden = false;
                     }
                     cache.fetched_at = Instant::now();
                 }

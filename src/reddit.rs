@@ -646,6 +646,8 @@ pub struct Comment {
     #[serde(default)]
     pub likes: Option<bool>,
     #[serde(default)]
+    pub score_hidden: bool,
+    #[serde(default)]
     pub depth: i64,
     #[serde(default)]
     pub created_utc: f64,
@@ -671,6 +673,8 @@ impl<'de> Deserialize<'de> for Comment {
             #[serde(default)]
             likes: Option<bool>,
             #[serde(default)]
+            score_hidden: bool,
+            #[serde(default)]
             depth: i64,
             #[serde(default)]
             created_utc: f64,
@@ -693,6 +697,7 @@ impl<'de> Deserialize<'de> for Comment {
             author: helper.author,
             score: helper.score,
             likes: helper.likes,
+            score_hidden: helper.score_hidden,
             depth: helper.depth,
             created_utc: helper.created_utc,
             replies,

@@ -378,6 +378,7 @@ impl InteractionService for MockInteractionService {
             author: "reddix".into(),
             score: 1,
             likes: None,
+            score_hidden: false,
             depth: 0,
             created_utc: 0.0,
             replies: None,
