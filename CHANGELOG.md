@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.2] - 2025-10-14
+### Fixed
+- Respect Reddit's hidden comment scores.
+
 ## [0.2.1] - 2025-10-13
 ### Changed
 - Inline previews now detect Kitty support at runtime, falling back to the legacy image placeholder while offering an external mpv launch when graphics are unavailable.
@@ -126,7 +130,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/ck-zhang/reddix/compare/v0.2.1...v0.2.2
 [0.1.21]: https://github.com/ck-zhang/reddix/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/ck-zhang/reddix/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/ck-zhang/reddix/compare/v0.1.18...v0.1.19
