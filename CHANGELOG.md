@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.3] - 2025-10-15
+### Added
+- Toggle to hide or reveal NSFW posts mid-session without leaving the feed.
+### Changed
+- Status bar and help copy now highlight the NSFW mode so the current setting is obvious.
+
 ## [0.2.2] - 2025-10-14
 ### Fixed
 - Respect Reddit's hidden comment scores.
@@ -130,7 +136,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial release with the polished login workflow, refreshed caching, and improved feed pagination.
 
-[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ck-zhang/reddix/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/ck-zhang/reddix/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/ck-zhang/reddix/compare/v0.2.1...v0.2.2
 [0.1.21]: https://github.com/ck-zhang/reddix/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/ck-zhang/reddix/compare/v0.1.19...v0.1.20

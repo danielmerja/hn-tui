@@ -14,6 +14,7 @@ Reddix - Reddit, refined for the terminal.
 - multi-account support
 - keyboard first navigation
 - smart caching
+- NSFW filter toggle
 
 ## Install
 
