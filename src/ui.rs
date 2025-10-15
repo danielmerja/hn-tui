@@ -3069,6 +3069,7 @@ pub struct Model {
     clipboard: Option<Clipboard>,
     kitty_status: KittyStatus,
     kitty_probe_in_progress: bool,
+    show_nsfw: bool,
 }
 
 impl Model {
@@ -3868,6 +3869,7 @@ impl Model {
             clipboard: None,
             kitty_status: KittyStatus::Unknown,
             kitty_probe_in_progress: false,
+            show_nsfw: true,
         };
         model.cache_scope = model.current_cache_scope();
         model.subreddits = model
@@ -3907,6 +3909,23 @@ impl Model {
             model.nav_mode = NavMode::Sorts;
         }
         model.ensure_subreddit_visible();
+
+        match model.store.show_nsfw_posts() {
+            Ok(Some(preference)) => {
+                model.show_nsfw = preference;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if model.status_message.is_empty() {
+                    model.status_message = format!("NSFW preference load failed: {err}");
+                } else {
+                    model.status_message = format!(
+                        "{} (NSFW preference load failed: {err})",
+                        model.status_message
+                    );
+                }
+            }
+        }
 
         model.initialize_kitty_detection();
 
@@ -4146,6 +4165,10 @@ impl Model {
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 self.open_action_menu();
                 return Ok(false);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.toggle_nsfw_filter()?;
+                dirty = true;
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -4958,7 +4981,8 @@ impl Model {
         self.action_menu_mode = ActionMenuMode::Navigation(state);
         self.action_menu_visible = true;
         self.status_message =
-            "Navigation: type to search · ↑/↓ choose · Enter/l open · Tab toggle typing · Esc clear/close · h back · Ctrl+H/J/K/L navigate (even when typing)".to_string();
+            "Navigation: type to search · ↑/↓ choose · Enter/l open · Tab toggle typing · Esc clear/close · n toggle NSFW · h back · Ctrl+H/J/K/L navigate (even when typing)"
+                .to_string();
         self.mark_dirty();
     }
 
@@ -5977,7 +6001,7 @@ impl Model {
                         .fg(COLOR_TEXT_PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" · Tab toggle typing · Esc clear/close"),
+                Span::raw(" · Tab toggle typing · Esc clear/close · n toggle NSFW"),
             ]),
             Line::from(vec![Span::raw(
                 "Ctrl+H/J/K/L navigate even when typing · Enter/l open · h back",
@@ -6036,6 +6060,7 @@ impl Model {
             HelpSection::new(
                 "Extras",
                 vec![
+                    ("n", "Toggle NSFW posts on/off"),
                     ("y", "Copy the highlighted comment"),
                     ("f", "Toggle fullscreen media preview"),
                     ("space / p (video)", "Pause or resume inline playback"),
@@ -7409,6 +7434,57 @@ impl Model {
         }
     }
 
+    fn listing_over18_params(&self) -> Vec<(String, String)> {
+        let flag = if self.show_nsfw { "on" } else { "off" };
+        vec![
+            ("include_over_18".to_string(), flag.to_string()),
+            ("search_include_over_18".to_string(), flag.to_string()),
+        ]
+    }
+
+    fn filter_nsfw_posts(&self, posts: &mut Vec<PostPreview>) -> usize {
+        if self.show_nsfw {
+            return 0;
+        }
+        let original_len = posts.len();
+        posts.retain(|preview| !preview.post.over_18);
+        original_len.saturating_sub(posts.len())
+    }
+
+    fn toggle_nsfw_filter(&mut self) -> Result<()> {
+        self.show_nsfw = !self.show_nsfw;
+        let toggle_message = if self.show_nsfw {
+            "NSFW posts enabled — refreshing feed..."
+        } else {
+            "NSFW posts hidden — refreshing feed..."
+        }
+        .to_string();
+
+        let persist = self.store.set_show_nsfw_posts(self.show_nsfw);
+        match &persist {
+            Ok(()) => {
+                self.status_message = toggle_message.clone();
+            }
+            Err(err) => {
+                self.status_message = format!("Failed to save NSFW preference: {err}");
+            }
+        }
+        self.mark_dirty();
+
+        if let Err(err) = self.reload_posts() {
+            self.status_message = format!("Failed to reload after NSFW toggle: {err}");
+            self.mark_dirty();
+            return Err(err);
+        }
+
+        if persist.is_ok() {
+            self.status_message = toggle_message;
+            self.mark_dirty();
+        }
+
+        Ok(())
+    }
+
     fn current_feed_target(&self) -> String {
         if self.subreddits.is_empty() {
             return "r/frontpage".to_string();
@@ -7865,11 +7941,20 @@ impl Model {
         from_cache: bool,
         mode: LoadMode,
     ) {
+        let filtered_nsfw = self.filter_nsfw_posts(&mut batch.posts);
         let label = navigation_display_name(target);
         match mode {
             LoadMode::Replace => {
                 if batch.posts.is_empty() {
-                    if !from_cache {
+                    let mut handled = false;
+                    if filtered_nsfw > 0 && !self.show_nsfw {
+                        self.status_message = format!(
+                            "All posts hidden by NSFW filter for {} ({}). Press n to show NSFW posts.",
+                            label,
+                            sort_label(sort)
+                        );
+                        handled = true;
+                    } else if !from_cache {
                         if let Some(fallback) = fallback_feed_target(target) {
                             if self.select_subreddit_by_name(fallback) {
                                 self.feed_after = None;
@@ -7892,15 +7977,17 @@ impl Model {
                         }
                     }
 
-                    let source = if from_cache { "(cached)" } else { "" };
-                    self.status_message = format!(
-                        "No posts available for {} ({}) {}",
-                        label,
-                        sort_label(sort),
-                        source
-                    )
-                    .trim()
-                    .to_string();
+                    if !handled {
+                        let source = if from_cache { "(cached)" } else { "" };
+                        self.status_message = format!(
+                            "No posts available for {} ({}) {}",
+                            label,
+                            sort_label(sort),
+                            source
+                        )
+                        .trim()
+                        .to_string();
+                    }
                     self.queue_active_kitty_delete();
                     self.posts.clear();
                     self.feed_after = batch.after.take();
@@ -7946,6 +8033,13 @@ impl Model {
                         sort_label(sort)
                     )
                 };
+                if filtered_nsfw > 0 && !self.show_nsfw {
+                    self.status_message.push_str(&format!(
+                        " · Hid {} NSFW post{}",
+                        filtered_nsfw,
+                        if filtered_nsfw == 1 { "" } else { "s" }
+                    ));
+                }
                 self.queue_active_kitty_delete();
                 self.posts = batch.posts;
                 self.feed_after = batch.after;
@@ -8002,6 +8096,17 @@ impl Model {
                 let previous_after = self.feed_after.clone();
                 self.feed_after = batch.after.clone();
                 if batch.posts.is_empty() {
+                    if filtered_nsfw > 0 && !self.show_nsfw {
+                        self.status_message = format!(
+                            "Hidden {} NSFW post{} from {} ({}) — requesting more...",
+                            filtered_nsfw,
+                            if filtered_nsfw == 1 { "" } else { "s" },
+                            label,
+                            sort_label(sort)
+                        );
+                        self.maybe_request_more_posts();
+                        return;
+                    }
                     if self.feed_after.is_none() || self.feed_after == previous_after {
                         if self.feed_after.is_none() {
                             self.status_message =
@@ -8070,6 +8175,13 @@ impl Model {
                     sort_label(sort),
                     self.posts.len()
                 );
+                if filtered_nsfw > 0 && !self.show_nsfw {
+                    self.status_message.push_str(&format!(
+                        " · Hid {} NSFW post{}",
+                        filtered_nsfw,
+                        if filtered_nsfw == 1 { "" } else { "s" }
+                    ));
+                }
                 self.ensure_post_visible();
                 self.maybe_request_more_posts();
             }
@@ -8174,6 +8286,7 @@ impl Model {
         let target_for_thread = target.clone();
         let opts = reddit::ListingOptions {
             after: None,
+            extra: self.listing_over18_params(),
             ..Default::default()
         };
 
@@ -8297,6 +8410,7 @@ impl Model {
         let target_for_thread = target.clone();
         let opts = reddit::ListingOptions {
             after: Some(after),
+            extra: self.listing_over18_params(),
             ..Default::default()
         };
 
@@ -8835,11 +8949,15 @@ impl Model {
             self.status_message.clone()
         };
         let version_status = format!("Reddix {}", self.version_summary());
-        let status_text = if raw_status.is_empty() {
-            version_status
-        } else {
-            format!("{raw_status} · {version_status}")
-        };
+        let mut status_parts: Vec<String> = Vec::new();
+        if !raw_status.is_empty() {
+            status_parts.push(raw_status);
+        }
+        if !self.show_nsfw {
+            status_parts.push("NSFW hidden".to_string());
+        }
+        status_parts.push(version_status);
+        let status_text = status_parts.join(" · ");
         let status_line = Paragraph::new(status_text).style(
             Style::default()
                 .fg(COLOR_TEXT_PRIMARY)

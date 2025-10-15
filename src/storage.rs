@@ -7,6 +7,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+const KEY_SHOW_NSFW: &str = "show_nsfw_posts";
+
 #[derive(Debug, Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -203,6 +205,40 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 )?;
             }
         }
+        Ok(())
+    }
+
+    pub fn show_nsfw_posts(&self) -> Result<Option<bool>> {
+        let conn = self.conn.lock();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                params![KEY_SHOW_NSFW],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("storage: query show nsfw preference")?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        match value.as_str() {
+            "1" => Ok(Some(true)),
+            "0" => Ok(Some(false)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn set_show_nsfw_posts(&self, show: bool) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+INSERT INTO app_state (key, value)
+VALUES (?1, ?2)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+"#,
+            params![KEY_SHOW_NSFW, if show { "1" } else { "0" }],
+        )
+        .context("storage: persist show nsfw preference")?;
         Ok(())
     }
 
@@ -559,6 +595,27 @@ mod tests {
 
         store.set_last_active_account_id(None).expect("clear id");
         assert_eq!(store.last_active_account_id().unwrap(), None);
+
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn remember_show_nsfw_posts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(Options { path: Some(path) }).unwrap();
+
+        assert_eq!(store.show_nsfw_posts().unwrap(), None);
+
+        store
+            .set_show_nsfw_posts(true)
+            .expect("persist show preference");
+        assert_eq!(store.show_nsfw_posts().unwrap(), Some(true));
+
+        store
+            .set_show_nsfw_posts(false)
+            .expect("persist hide preference");
+        assert_eq!(store.show_nsfw_posts().unwrap(), Some(false));
 
         store.close().unwrap();
     }
