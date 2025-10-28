@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.4] - 2025-10-16
+### Added
+- Commenting workflow inside the Comments pane so `w` lets you write threads and replies without leaving Reddix.
+
 ## [0.2.3] - 2025-10-15
 ### Added
 - Toggle to hide or reveal NSFW posts mid-session without leaving the feed.
