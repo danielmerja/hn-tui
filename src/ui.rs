@@ -43,7 +43,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use reqwest::{blocking::Client, header::CONTENT_TYPE, Error as ReqwestError};
 use semver::Version;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use url::Url;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -251,6 +251,7 @@ enum ActionMenuAction {
     OpenVideoExternal,
     OpenNavigation,
     ToggleFullscreen,
+    ComposeComment,
 }
 
 #[derive(Clone)]
@@ -665,6 +666,7 @@ fn collect_comments(
             depth,
             descendant_count: 0,
             links: link_entries,
+            is_post_root: false,
         });
         let child_count = comment
             .replies
@@ -979,6 +981,284 @@ struct CommentEntry {
     depth: usize,
     descendant_count: usize,
     links: Vec<LinkEntry>,
+    is_post_root: bool,
+}
+
+#[derive(Clone)]
+enum CommentTarget {
+    Post {
+        post_fullname: String,
+        post_title: String,
+        subreddit: String,
+    },
+    Comment {
+        post_fullname: String,
+        post_title: String,
+        comment_fullname: String,
+        author: String,
+    },
+}
+
+impl CommentTarget {
+    fn parent_fullname(&self) -> &str {
+        match self {
+            CommentTarget::Post { post_fullname, .. } => post_fullname,
+            CommentTarget::Comment {
+                comment_fullname, ..
+            } => comment_fullname,
+        }
+    }
+
+    fn post_fullname(&self) -> &str {
+        match self {
+            CommentTarget::Post { post_fullname, .. } => post_fullname,
+            CommentTarget::Comment { post_fullname, .. } => post_fullname,
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            CommentTarget::Post {
+                post_title,
+                subreddit,
+                ..
+            } => format!("Replying to {} in {}", post_title, subreddit),
+            CommentTarget::Comment { author, .. } => {
+                if author.trim().is_empty() {
+                    "Replying to a deleted comment".to_string()
+                } else {
+                    format!("Replying to comment by u/{}", author.trim())
+                }
+            }
+        }
+    }
+
+    fn post_title(&self) -> &str {
+        match self {
+            CommentTarget::Post { post_title, .. } => post_title,
+            CommentTarget::Comment { post_title, .. } => post_title,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CommentBuffer {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl CommentBuffer {
+    fn new() -> Self {
+        Self {
+            lines: vec![String::new()],
+            cursor_row: 0,
+            cursor_col: 0,
+        }
+    }
+
+    fn as_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn line_len(&self, row: usize) -> usize {
+        self.lines
+            .get(row)
+            .map(|line| line.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn clamp_cursor(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        if self.cursor_row >= self.lines.len() {
+            self.cursor_row = self.lines.len().saturating_sub(1);
+        }
+        let max_col = self.line_len(self.cursor_row);
+        if self.cursor_col > max_col {
+            self.cursor_col = max_col;
+        }
+    }
+
+    fn line_byte_index(line: &str, col: usize) -> usize {
+        if col == 0 {
+            return 0;
+        }
+        let mut iter = line.char_indices();
+        let mut result = line.len();
+        for (idx, (byte_idx, _)) in iter.by_ref().enumerate() {
+            if idx == col {
+                result = byte_idx;
+                break;
+            }
+        }
+        if col >= line.chars().count() {
+            line.len()
+        } else {
+            result
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if ch == '\n' {
+            self.insert_newline();
+            return;
+        }
+        self.clamp_cursor();
+        if let Some(line) = self.lines.get_mut(self.cursor_row) {
+            let insert_at = Self::line_byte_index(line, self.cursor_col);
+            line.insert(insert_at, ch);
+            self.cursor_col += 1;
+        }
+    }
+
+    fn insert_newline(&mut self) {
+        self.clamp_cursor();
+        if let Some(line) = self.lines.get_mut(self.cursor_row) {
+            let split_at = Self::line_byte_index(line, self.cursor_col);
+            let tail = line.split_off(split_at);
+            self.lines.insert(self.cursor_row + 1, tail);
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        } else {
+            self.lines.push(String::new());
+            self.cursor_row = self.lines.len().saturating_sub(1);
+            self.cursor_col = 0;
+        }
+    }
+
+    fn backspace(&mut self) {
+        self.clamp_cursor();
+        if self.cursor_row == 0 && self.cursor_col == 0 {
+            return;
+        }
+        if self.cursor_col > 0 {
+            if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                let remove_at = Self::line_byte_index(line, self.cursor_col.saturating_sub(1));
+                if remove_at < line.len() {
+                    line.remove(remove_at);
+                    self.cursor_col = self.cursor_col.saturating_sub(1);
+                }
+            }
+        } else if self.cursor_row > 0 {
+            let current_line = self.lines.remove(self.cursor_row);
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+            if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                let prev_len = line.chars().count();
+                line.push_str(&current_line);
+                self.cursor_col = prev_len;
+            } else {
+                self.lines.insert(0, current_line);
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+            }
+        }
+        self.clamp_cursor();
+    }
+
+    fn delete(&mut self) {
+        self.clamp_cursor();
+        if let Some(line) = self.lines.get_mut(self.cursor_row) {
+            let line_len = line.chars().count();
+            if self.cursor_col < line_len {
+                let remove_at = Self::line_byte_index(line, self.cursor_col);
+                if remove_at < line.len() {
+                    line.remove(remove_at);
+                }
+                return;
+            }
+        }
+        if self.cursor_row + 1 < self.lines.len() {
+            let next_line = self.lines.remove(self.cursor_row + 1);
+            if let Some(line) = self.lines.get_mut(self.cursor_row) {
+                line.push_str(&next_line);
+            } else {
+                self.lines.push(next_line);
+            }
+        }
+        self.clamp_cursor();
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.line_len(self.cursor_row);
+        }
+        self.clamp_cursor();
+    }
+
+    fn move_right(&mut self) {
+        let max_col = self.line_len(self.cursor_row);
+        if self.cursor_col < max_col {
+            self.cursor_col += 1;
+        } else if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+        self.clamp_cursor();
+    }
+
+    fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            let max_col = self.line_len(self.cursor_row);
+            self.cursor_col = self.cursor_col.min(max_col);
+        }
+        self.clamp_cursor();
+    }
+
+    fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            let max_col = self.line_len(self.cursor_row);
+            self.cursor_col = self.cursor_col.min(max_col);
+        }
+        self.clamp_cursor();
+    }
+
+    fn move_home(&mut self) {
+        self.cursor_col = 0;
+        self.clamp_cursor();
+    }
+
+    fn move_end(&mut self) {
+        self.cursor_col = self.line_len(self.cursor_row);
+    }
+}
+
+struct CommentComposer {
+    target: CommentTarget,
+    buffer: CommentBuffer,
+    status: Option<String>,
+    submitting: bool,
+    scroll_row: usize,
+}
+
+impl CommentComposer {
+    fn new(target: CommentTarget) -> Self {
+        Self {
+            target,
+            buffer: CommentBuffer::new(),
+            status: None,
+            submitting: false,
+            scroll_row: 0,
+        }
+    }
+
+    fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    fn set_status<S: Into<String>>(&mut self, message: S) {
+        self.status = Some(message.into());
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
 }
 
 #[derive(Clone)]
@@ -1016,6 +1296,12 @@ struct PendingComments {
     post_name: String,
     cancel_flag: Arc<AtomicBool>,
     sort: reddit::CommentSortOption,
+}
+
+struct PendingCommentSubmit {
+    request_id: u64,
+    post_fullname: String,
+    target: CommentTarget,
 }
 
 struct PendingSubreddits {
@@ -1118,6 +1404,10 @@ enum AsyncResponse {
         account_id: i64,
         result: Result<()>,
     },
+    CommentSubmit {
+        request_id: u64,
+        result: Result<reddit::Comment>,
+    },
     VoteResult {
         target: VoteTarget,
         requested: i32,
@@ -1139,6 +1429,22 @@ fn comment_lines(
     let spacer = " ".repeat(indicator.chars().count());
     let rest_prefix = format!("{indent_units}{spacer} ");
     let body_prefix = format!("{indent_units}{spacer}  ");
+
+    if comment.is_post_root {
+        let mut display = comment.body.clone();
+        if display.trim().is_empty() || display.contains("Shift+W") {
+            display =
+                "Comment section · w starts a new thread · w on a comment replies".to_string();
+        }
+        let style = meta_style.add_modifier(Modifier::ITALIC);
+        return wrap_with_prefixes(
+            display.as_str(),
+            width,
+            indicator_prefix.as_str(),
+            rest_prefix.as_str(),
+            style,
+        );
+    }
 
     let author = if comment.author.trim().is_empty() {
         "[deleted]"
@@ -3058,11 +3364,13 @@ pub struct Model {
     spinner: Spinner,
     config_path: String,
     comment_status: String,
+    comment_composer: Option<CommentComposer>,
     response_tx: Sender<AsyncResponse>,
     response_rx: Receiver<AsyncResponse>,
     next_request_id: u64,
     pending_posts: Option<PendingPosts>,
     pending_comments: Option<PendingComments>,
+    pending_comment_submit: Option<PendingCommentSubmit>,
     pending_subreddits: Option<PendingSubreddits>,
     needs_video_refresh: bool,
     active_video: Option<ActiveVideo>,
@@ -3858,11 +4166,13 @@ impl Model {
             spinner: Spinner::new(),
             config_path: opts.config_path.clone(),
             comment_status: "Select a post to load comments.".to_string(),
+            comment_composer: None,
             response_tx,
             response_rx,
             next_request_id: 1,
             pending_posts: None,
             pending_comments: None,
+            pending_comment_submit: None,
             pending_subreddits: None,
             needs_video_refresh: false,
             active_video: None,
@@ -4101,6 +4411,10 @@ impl Model {
             return Ok(false);
         }
 
+        if self.comment_composer.is_some() {
+            return self.handle_comment_composer_key(key);
+        }
+
         if self.menu_visible {
             return self.handle_menu_key(code);
         }
@@ -4224,6 +4538,10 @@ impl Model {
             KeyCode::Char('S') => {
                 self.save_high_res_media()?;
             }
+            KeyCode::Char('w') => {
+                self.open_comment_composer()?;
+                return Ok(false);
+            }
             KeyCode::Char('c') => {
                 if self.focused_pane == Pane::Comments {
                     self.toggle_selected_comment_fold();
@@ -4251,6 +4569,16 @@ impl Model {
                 } else if self.focused_pane == Pane::Posts && self.banner_selected() {
                     self.install_update()?;
                     dirty = true;
+                } else if self.focused_pane == Pane::Comments && !self.comment_sort_selected {
+                    let open_root = self
+                        .selected_comment_index()
+                        .and_then(|idx| self.comments.get(idx))
+                        .map(|entry| entry.is_post_root)
+                        .unwrap_or(true);
+                    if open_root {
+                        self.open_comment_composer()?;
+                        return Ok(false);
+                    }
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
@@ -4499,7 +4827,11 @@ impl Model {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Result<()> {
-        if self.menu_visible || self.action_menu_visible || self.help_visible {
+        if self.menu_visible
+            || self.action_menu_visible
+            || self.help_visible
+            || self.comment_composer.is_some()
+        {
             return Ok(());
         }
 
@@ -4914,6 +5246,51 @@ impl Model {
             fullscreen_entry = fullscreen_entry.disabled();
         }
         entries.push(fullscreen_entry);
+
+        if self.comment_composer.is_some() {
+            entries.push(
+                ActionMenuEntry::new(
+                    "Write a comment… (already composing)",
+                    ActionMenuAction::ComposeComment,
+                )
+                .disabled(),
+            );
+        } else if self.pending_comment_submit.is_some() {
+            entries.push(
+                ActionMenuEntry::new(
+                    "Write a comment… (posting…)",
+                    ActionMenuAction::ComposeComment,
+                )
+                .disabled(),
+            );
+        } else if self.interaction_service.is_none() {
+            entries.push(
+                ActionMenuEntry::new(
+                    "Write a comment… (sign in required)",
+                    ActionMenuAction::ComposeComment,
+                )
+                .disabled(),
+            );
+        } else {
+            match self.comment_target_for_context() {
+                Ok(target) => {
+                    let label = Self::comment_action_label(&target);
+                    entries.push(ActionMenuEntry::new(
+                        label,
+                        ActionMenuAction::ComposeComment,
+                    ));
+                }
+                Err(err) => {
+                    entries.push(
+                        ActionMenuEntry::new(
+                            format!("Write a comment… ({})", err),
+                            ActionMenuAction::ComposeComment,
+                        )
+                        .disabled(),
+                    );
+                }
+            }
+        }
 
         entries.push(ActionMenuEntry::new(
             "Search subreddits & users…",
@@ -5421,6 +5798,19 @@ impl Model {
                                 self.toggle_media_fullscreen()?;
                                 if self.media_fullscreen != was_fullscreen {
                                     self.close_action_menu(None);
+                                } else {
+                                    self.action_menu_items = self.build_action_menu_entries();
+                                    if self.action_menu_selected >= self.action_menu_items.len() {
+                                        self.action_menu_selected =
+                                            self.action_menu_items.len().saturating_sub(1);
+                                    }
+                                }
+                            }
+                            ActionMenuAction::ComposeComment => {
+                                self.open_comment_composer()?;
+                                if self.comment_composer.is_some() {
+                                    self.close_action_menu(None);
+                                    return Ok(false);
                                 } else {
                                     self.action_menu_items = self.build_action_menu_entries();
                                     if self.action_menu_selected >= self.action_menu_items.len() {
@@ -6062,6 +6452,11 @@ impl Model {
                 vec![
                     ("n", "Toggle NSFW posts on/off"),
                     ("y", "Copy the highlighted comment"),
+                    (
+                        "w",
+                        "Write a comment (highlight the placeholder to post at the root)",
+                    ),
+                    ("Ctrl+S (composer)", "Submit the comment you are writing"),
                     ("f", "Toggle fullscreen media preview"),
                     ("space / p (video)", "Pause or resume inline playback"),
                     (
@@ -6069,6 +6464,7 @@ impl Model {
                         "Seek inline video backward/forward 5 seconds",
                     ),
                     ("Esc (during video)", "Stop inline video playback"),
+                    ("Esc (composer)", "Discard the comment draft"),
                     ("U", "Run the available updater"),
                     ("q / Esc", "Quit Reddix"),
                 ],
@@ -6453,6 +6849,7 @@ impl Model {
                     Ok(comments) => {
                         self.cache_comments(&post_name, sort, comments.clone());
                         self.comments = comments;
+                        self.insert_post_root_comment_placeholder();
                         self.collapsed_comments.clear();
                         self.selected_comment = 0;
                         self.comment_offset.set(0);
@@ -6866,6 +7263,47 @@ impl Model {
                 }
                 self.mark_dirty();
             }
+            AsyncResponse::CommentSubmit { request_id, result } => {
+                let Some(pending) = self.pending_comment_submit.take() else {
+                    return;
+                };
+                if pending.request_id != request_id {
+                    self.pending_comment_submit = Some(pending);
+                    return;
+                }
+                let PendingCommentSubmit {
+                    post_fullname,
+                    target,
+                    ..
+                } = pending;
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.submitting = false;
+                }
+
+                match result {
+                    Ok(comment) => {
+                        self.status_message = "Comment posted.".to_string();
+                        self.insert_posted_comment(comment, target);
+                        self.comment_composer = None;
+                        self.comment_cache
+                            .retain(|key, _| key.post_name != post_fullname);
+                    }
+                    Err(err) => {
+                        let err_text = err.to_string();
+                        let mut message = format!("Failed to submit comment: {}", err_text);
+                        if err_text.to_lowercase().contains("forbidden") {
+                            message.push_str(
+                                " (Reddit rejected the request — ensure reddit.scopes includes \"submit\" and re-authorize if needed.)",
+                            );
+                        }
+                        if let Some(composer) = self.comment_composer.as_mut() {
+                            composer.set_status(message.clone());
+                        }
+                        self.status_message = message;
+                    }
+                }
+                self.mark_dirty();
+            }
             AsyncResponse::VoteResult {
                 target,
                 requested,
@@ -7144,13 +7582,22 @@ impl Model {
             }
         };
 
-        let (fullname, author) = match self.comments.get(comment_index) {
-            Some(comment) => (comment.name.clone(), comment.author.clone()),
+        let (fullname, author, is_root) = match self.comments.get(comment_index) {
+            Some(comment) => (
+                comment.name.clone(),
+                comment.author.clone(),
+                comment.is_post_root,
+            ),
             None => {
                 self.status_message = "Comment selection is out of sync.".to_string();
                 return;
             }
         };
+
+        if is_root {
+            self.status_message = "Top-level placeholder cannot be voted on.".to_string();
+            return;
+        }
 
         if fullname.is_empty() {
             self.status_message = "Unable to vote on this comment.".to_string();
@@ -7186,8 +7633,18 @@ impl Model {
                 .map(|post| post.post.name.clone())
             {
                 let key = CommentCacheKey::new(&post_name, self.comment_sort);
+                let root_offset = if self
+                    .comments
+                    .first()
+                    .is_some_and(|entry| entry.is_post_root)
+                {
+                    1
+                } else {
+                    0
+                };
+                let cache_index = comment_index.saturating_sub(root_offset);
                 if let Some(cache) = self.scoped_comment_cache_mut(&key) {
-                    if let Some(entry) = cache.comments.get_mut(comment_index) {
+                    if let Some(entry) = cache.comments.get_mut(cache_index) {
                         entry.score = score;
                         entry.likes = likes;
                         entry.score_hidden = false;
@@ -7227,6 +7684,11 @@ impl Model {
 
         let (text, author_label) = match self.comments.get(comment_index) {
             Some(comment) => {
+                if comment.is_post_root {
+                    self.status_message = "Highlight a real comment before copying.".to_string();
+                    self.mark_dirty();
+                    return Ok(());
+                }
                 let cleaned = comment.raw_body.trim_end().to_string();
                 let label = if comment.author.trim().is_empty() {
                     "[deleted]".to_string()
@@ -7252,6 +7714,614 @@ impl Model {
         self.status_message = format!("Copied comment by {} to the clipboard.", author_label);
         self.mark_dirty();
         Ok(())
+    }
+
+    fn ellipsize_label(text: &str, max_width: usize) -> String {
+        if UnicodeWidthStr::width(text) <= max_width {
+            return text.to_string();
+        }
+        let limit = max_width.saturating_sub(1).max(1);
+        let mut current = 0;
+        let mut trimmed = String::new();
+        for ch in text.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current + width > limit {
+                break;
+            }
+            trimmed.push(ch);
+            current += width;
+        }
+        if trimmed.is_empty() {
+            "…".to_string()
+        } else {
+            trimmed.push('…');
+            trimmed
+        }
+    }
+
+    fn comment_target_for_context(&self) -> Result<CommentTarget> {
+        if self.banner_selected() {
+            bail!("Select a post before commenting.");
+        }
+        let post = self
+            .posts
+            .get(self.selected_post)
+            .ok_or_else(|| anyhow!("Select a post before commenting."))?;
+        if post.post.name.trim().is_empty() {
+            bail!("This post cannot be commented on.");
+        }
+
+        if self.focused_pane != Pane::Comments {
+            return Ok(CommentTarget::Post {
+                post_fullname: post.post.name.clone(),
+                post_title: post.post.title.clone(),
+                subreddit: post.post.subreddit.clone(),
+            });
+        }
+
+        if let Some(index) = self.selected_comment_index() {
+            if let Some(comment) = self.comments.get(index) {
+                if !comment.name.trim().is_empty() {
+                    return Ok(CommentTarget::Comment {
+                        post_fullname: post.post.name.clone(),
+                        post_title: post.post.title.clone(),
+                        comment_fullname: comment.name.clone(),
+                        author: comment.author.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(CommentTarget::Post {
+            post_fullname: post.post.name.clone(),
+            post_title: post.post.title.clone(),
+            subreddit: post.post.subreddit.clone(),
+        })
+    }
+
+    fn comment_action_label(target: &CommentTarget) -> String {
+        match target {
+            CommentTarget::Post { post_title, .. } => {
+                let short = Self::ellipsize_label(post_title, 48);
+                format!("Comment on \"{}\"", short)
+            }
+            CommentTarget::Comment { author, .. } => {
+                if author.trim().is_empty() {
+                    "Reply to comment".to_string()
+                } else {
+                    format!("Reply to u/{}", author.trim())
+                }
+            }
+        }
+    }
+
+    fn open_comment_composer(&mut self) -> Result<()> {
+        if self.comment_composer.is_some() {
+            return Ok(());
+        }
+        if self.interaction_service.is_none() {
+            self.status_message =
+                "Sign in to a Reddit account before writing a comment.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+        if self.pending_comment_submit.is_some() {
+            self.status_message = "A comment submission is already in progress.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let target = match self.comment_target_for_context() {
+            Ok(result) => result,
+            Err(err) => {
+                self.status_message = err.to_string();
+                self.mark_dirty();
+                return Ok(());
+            }
+        };
+
+        self.queue_active_kitty_delete();
+        self.close_action_menu(None);
+        self.help_visible = false;
+        self.menu_visible = false;
+
+        let prompt = match &target {
+            CommentTarget::Post { post_title, .. } => {
+                let short = Self::ellipsize_label(post_title, 48);
+                format!("Commenting on \"{}\" — Ctrl+S submits, Esc cancels.", short)
+            }
+            CommentTarget::Comment { author, .. } => {
+                let base = if author.trim().is_empty() {
+                    "Replying to a deleted comment".to_string()
+                } else {
+                    format!("Replying to u/{}", author.trim())
+                };
+                format!("{base} — Ctrl+S submits, Esc cancels.")
+            }
+        };
+
+        self.comment_composer = Some(CommentComposer::new(target));
+        self.status_message = prompt;
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn insert_post_root_comment_placeholder(&mut self) {
+        let message = if self.comments.iter().any(|entry| !entry.is_post_root) {
+            "Comment section · w starts a new thread · w on a comment replies".to_string()
+        } else {
+            "Comment section · w starts the discussion".to_string()
+        };
+
+        if let Some(existing) = self.comments.iter_mut().find(|entry| entry.is_post_root) {
+            existing.raw_body = message.clone();
+            existing.body = message;
+            return;
+        }
+
+        let placeholder = CommentEntry {
+            name: String::new(),
+            author: String::new(),
+            raw_body: message.clone(),
+            body: message,
+            score: 0,
+            likes: None,
+            score_hidden: false,
+            depth: 0,
+            descendant_count: 0,
+            links: Vec::new(),
+            is_post_root: true,
+        };
+
+        self.comments.insert(0, placeholder);
+    }
+
+    fn insert_posted_comment(&mut self, comment: reddit::Comment, target: CommentTarget) {
+        let post_name = target.post_fullname().to_string();
+        if self
+            .posts
+            .get(self.selected_post)
+            .map(|post| post.post.name.as_str())
+            != Some(post_name.as_str())
+        {
+            return;
+        }
+
+        self.insert_post_root_comment_placeholder();
+
+        let reddit::Comment {
+            name,
+            body,
+            author,
+            score,
+            likes,
+            score_hidden,
+            depth,
+            ..
+        } = comment;
+
+        let raw_body = body.clone();
+        let (clean_body, found_links) = scrub_links(&body);
+        let author_label = if author.trim().is_empty() {
+            "[deleted]".to_string()
+        } else {
+            format!("u/{}", author.trim())
+        };
+        let mut link_entries = Vec::new();
+        for (idx, url) in found_links.into_iter().enumerate() {
+            let label = format!("Comment link {} ({author_label})", idx + 1);
+            link_entries.push(LinkEntry::new(label, url));
+        }
+
+        let mut entry = CommentEntry {
+            name,
+            author,
+            raw_body,
+            body: clean_body,
+            score,
+            likes,
+            score_hidden,
+            depth: 0,
+            descendant_count: 0,
+            links: link_entries,
+            is_post_root: false,
+        };
+
+        let mut insert_index = self.comments.len();
+
+        match &target {
+            CommentTarget::Post { .. } => {
+                entry.depth = 0;
+                if let Some(idx) = self
+                    .comments
+                    .iter()
+                    .position(|comment| comment.is_post_root)
+                {
+                    insert_index = idx + 1;
+                } else {
+                    insert_index = 0;
+                }
+            }
+            CommentTarget::Comment {
+                comment_fullname, ..
+            } => {
+                if let Some(parent_idx) = self
+                    .comments
+                    .iter()
+                    .position(|entry| entry.name == *comment_fullname)
+                {
+                    let parent_depth = self.comments[parent_idx].depth;
+                    entry.depth = parent_depth + 1;
+                    self.collapsed_comments.remove(&parent_idx);
+                    insert_index = parent_idx + 1;
+                    while insert_index < self.comments.len()
+                        && self.comments[insert_index].depth > parent_depth
+                    {
+                        insert_index += 1;
+                    }
+                    let mut search_depth = entry.depth;
+                    for idx in (0..=parent_idx).rev() {
+                        if self.comments[idx].is_post_root {
+                            continue;
+                        }
+                        if self.comments[idx].depth < search_depth {
+                            self.comments[idx].descendant_count =
+                                self.comments[idx].descendant_count.saturating_add(1);
+                            search_depth = self.comments[idx].depth;
+                            if search_depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    entry.depth = depth.max(0) as usize;
+                }
+            }
+        }
+
+        if insert_index > self.comments.len() {
+            insert_index = self.comments.len();
+        }
+
+        self.comments.insert(insert_index, entry);
+        self.insert_post_root_comment_placeholder();
+
+        if let Some(post) = self.posts.get_mut(self.selected_post) {
+            if post.post.name == post_name {
+                post.post.num_comments = post.post.num_comments.saturating_add(1);
+                self.post_rows.remove(&post.post.name);
+            }
+        }
+
+        self.rebuild_visible_comments_internal(Some(insert_index), false);
+        self.recompute_comment_status();
+        self.ensure_comment_visible();
+        self.mark_dirty();
+    }
+
+    fn cancel_comment_composer(&mut self, message: Option<&str>) {
+        if self.comment_composer.is_none() {
+            return;
+        }
+        if self.pending_comment_submit.is_some() {
+            if let Some(composer) = self.comment_composer.as_mut() {
+                composer.set_status("Comment submission already in flight…");
+            }
+            self.status_message =
+                "Comment submission already in progress; wait for it to finish.".to_string();
+            self.mark_dirty();
+            return;
+        }
+        self.comment_composer = None;
+        if let Some(msg) = message {
+            self.status_message = msg.to_string();
+        } else {
+            self.status_message = "Comment discarded.".to_string();
+        }
+        self.mark_dirty();
+    }
+
+    fn submit_comment(&mut self) -> Result<()> {
+        let Some(composer) = self.comment_composer.as_mut() else {
+            return Ok(());
+        };
+        if composer.submitting {
+            return Ok(());
+        }
+
+        let service = match self.interaction_service.as_ref() {
+            Some(service) => Arc::clone(service),
+            None => {
+                self.status_message =
+                    "Sign in to a Reddit account before writing a comment.".to_string();
+                self.mark_dirty();
+                return Ok(());
+            }
+        };
+
+        let text = composer.buffer.as_text();
+        if text.trim().is_empty() {
+            composer.set_status("Write something before submitting.");
+            self.status_message = "Comment text cannot be empty.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let target = composer.target.clone();
+        let parent = target.parent_fullname().to_string();
+        let post_fullname = target.post_fullname().to_string();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+
+        composer.submitting = true;
+        composer.clear_status();
+        self.status_message = "Posting comment…".to_string();
+        self.pending_comment_submit = Some(PendingCommentSubmit {
+            request_id,
+            post_fullname,
+            target: target.clone(),
+        });
+        self.mark_dirty();
+
+        let tx = self.response_tx.clone();
+        thread::spawn(move || {
+            let payload = text;
+            let result = service.reply(parent.as_str(), payload.as_str());
+            let _ = tx.send(AsyncResponse::CommentSubmit { request_id, result });
+        });
+
+        Ok(())
+    }
+
+    fn handle_comment_composer_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(composer_ref) = self.comment_composer.as_ref() else {
+            return Ok(false);
+        };
+        if composer_ref.submitting {
+            if matches!(key.code, KeyCode::Esc) {
+                self.status_message =
+                    "Comment submission already in progress; please wait.".to_string();
+                self.mark_dirty();
+            }
+            return Ok(false);
+        }
+
+        let mut dirty = false;
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_comment_composer(Some("Comment discarded."));
+                return Ok(false);
+            }
+            KeyCode::Enter
+                if modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.submit_comment()?;
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.insert_newline();
+                    composer.clear_status();
+                }
+                dirty = true;
+            }
+            KeyCode::Backspace => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.backspace();
+                    composer.clear_status();
+                }
+                dirty = true;
+            }
+            KeyCode::Delete => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.delete();
+                    composer.clear_status();
+                }
+                dirty = true;
+            }
+            KeyCode::Left => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_left();
+                }
+                dirty = true;
+            }
+            KeyCode::Right => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_right();
+                }
+                dirty = true;
+            }
+            KeyCode::Up => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_up();
+                }
+                dirty = true;
+            }
+            KeyCode::Down => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_down();
+                }
+                dirty = true;
+            }
+            KeyCode::Home => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_home();
+                }
+                dirty = true;
+            }
+            KeyCode::End => {
+                if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.move_end();
+                }
+                dirty = true;
+            }
+            KeyCode::Char(ch) => {
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    || modifiers.contains(KeyModifiers::ALT)
+                {
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(ch, 'm' | 'M' | 's' | 'S' | '\r' | '\n')
+                    {
+                        self.submit_comment()?;
+                        return Ok(false);
+                    }
+                    if modifiers.contains(KeyModifiers::CONTROL) && matches!(ch, 'u' | 'U') {
+                        if let Some(composer) = self.comment_composer.as_mut() {
+                            while composer.buffer.cursor_col > 0 {
+                                composer.buffer.backspace();
+                            }
+                            composer.clear_status();
+                        }
+                        dirty = true;
+                    }
+                } else if let Some(composer) = self.comment_composer.as_mut() {
+                    composer.buffer.insert_char(ch);
+                    composer.clear_status();
+                    dirty = true;
+                }
+            }
+            _ => {}
+        }
+
+        if dirty {
+            self.mark_dirty();
+        }
+        Ok(false)
+    }
+
+    fn draw_comment_composer(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(composer) = self.comment_composer.as_mut() else {
+            return;
+        };
+
+        let popup = centered_rect(70, 70, area);
+        frame.render_widget(Clear, popup);
+
+        let title = Span::styled(
+            "Write a comment",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLOR_ACCENT))
+            .style(Style::default().bg(COLOR_PANEL_BG));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(4),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+
+        let title_line = Self::ellipsize_label(composer.target.post_title(), 64);
+        let header_lines: Vec<Line<'static>> = vec![
+            Line::from(vec![Span::styled(
+                title_line,
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(
+                composer.target.description(),
+                Style::default().fg(COLOR_TEXT_SECONDARY),
+            )]),
+        ];
+        let header = Paragraph::new(Text::from(header_lines))
+            .style(Style::default().fg(COLOR_TEXT_PRIMARY).bg(COLOR_PANEL_BG));
+        frame.render_widget(header, sections[0]);
+
+        let text_block = Block::default()
+            .padding(Padding::new(1, 1, 0, 0))
+            .style(Style::default().bg(COLOR_PANEL_BG));
+        let text_inner = text_block.inner(sections[1]);
+
+        let visible_height = text_inner.height.max(1) as usize;
+        let max_scroll = composer.buffer.lines.len().saturating_sub(visible_height);
+        if composer.scroll_row > max_scroll {
+            composer.scroll_row = max_scroll;
+        }
+        if composer.buffer.cursor_row < composer.scroll_row {
+            composer.scroll_row = composer.buffer.cursor_row;
+        } else if composer.buffer.cursor_row >= composer.scroll_row.saturating_add(visible_height) {
+            composer.scroll_row = composer
+                .buffer
+                .cursor_row
+                .saturating_add(1)
+                .saturating_sub(visible_height);
+        }
+
+        let text = Text::from(composer.buffer.as_text());
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(COLOR_TEXT_PRIMARY).bg(COLOR_PANEL_BG))
+            .block(text_block)
+            .scroll((composer.scroll_row as u16, 0));
+        frame.render_widget(paragraph, sections[1]);
+
+        let mut footer_lines: Vec<Line<'static>> = Vec::new();
+        if composer.submitting {
+            footer_lines.push(Line::from(vec![Span::styled(
+                "Posting comment…",
+                Style::default().fg(COLOR_ACCENT),
+            )]));
+        } else {
+            footer_lines.push(Line::from(vec![Span::styled(
+                "Ctrl+S submit · Esc cancel · Enter newline",
+                Style::default().fg(COLOR_TEXT_SECONDARY),
+            )]));
+        }
+        if let Some(status) = composer.status() {
+            footer_lines.push(Line::from(vec![Span::styled(
+                status.to_string(),
+                Style::default().fg(COLOR_ERROR),
+            )]));
+        }
+        let footer = Paragraph::new(Text::from(footer_lines))
+            .style(Style::default().fg(COLOR_TEXT_PRIMARY).bg(COLOR_PANEL_BG));
+        frame.render_widget(footer, sections[2]);
+
+        if !composer.submitting {
+            let mut cursor_x = text_inner.x;
+            if let Some(line) = composer.buffer.lines.get(composer.buffer.cursor_row) {
+                let visual_col = line
+                    .chars()
+                    .take(composer.buffer.cursor_col)
+                    .fold(0u16, |acc, ch| {
+                        acc + UnicodeWidthChar::width(ch).unwrap_or(0) as u16
+                    });
+                cursor_x = cursor_x.saturating_add(visual_col);
+            }
+            let max_x = text_inner
+                .x
+                .saturating_add(text_inner.width.saturating_sub(1));
+            if cursor_x > max_x {
+                cursor_x = max_x;
+            }
+            let cursor_y = text_inner
+                .y
+                .saturating_add(
+                    (composer
+                        .buffer
+                        .cursor_row
+                        .saturating_sub(composer.scroll_row)) as u16,
+                )
+                .min(
+                    text_inner
+                        .y
+                        .saturating_add(text_inner.height.saturating_sub(1)),
+                );
+            frame.set_cursor(cursor_x, cursor_y);
+        }
     }
 
     fn selected_comment_index(&self) -> Option<usize> {
@@ -7313,19 +8383,34 @@ impl Model {
     fn recompute_comment_status(&mut self) {
         let sort_display = comment_sort_label(self.comment_sort);
 
-        if self.comments.is_empty() {
+        let total_real = self
+            .comments
+            .iter()
+            .filter(|entry| !entry.is_post_root)
+            .count();
+
+        if total_real == 0 {
             self.comment_status = format!("No comments yet · sorted by {}", sort_display);
             return;
         }
 
-        let total = self.comments.len();
-        let visible = self.visible_comment_indices.len();
-        if visible == total {
-            self.comment_status = format!("{total} comments loaded · sorted by {}", sort_display);
+        let visible_real = self
+            .visible_comment_indices
+            .iter()
+            .filter(|idx| {
+                self.comments
+                    .get(**idx)
+                    .is_some_and(|entry| !entry.is_post_root)
+            })
+            .count();
+
+        if visible_real == total_real {
+            self.comment_status =
+                format!("{total_real} comments loaded · sorted by {}", sort_display);
         } else {
-            let hidden = total.saturating_sub(visible);
+            let hidden = total_real.saturating_sub(visible_real);
             self.comment_status = format!(
-                "{total} comments loaded · {visible} visible · {hidden} hidden · sorted by {}",
+                "{total_real} comments loaded · {visible_real} visible · {hidden} hidden · sorted by {}",
                 sort_display
             );
         }
@@ -7344,6 +8429,13 @@ impl Model {
                 return;
             }
         };
+
+        if entry.is_post_root {
+            self.status_message =
+                "Highlight the placeholder and press Enter or w to comment on the post."
+                    .to_string();
+            return;
+        }
 
         if entry.descendant_count == 0 {
             self.status_message = "Comment has no replies to fold.".to_string();
@@ -8837,27 +9929,40 @@ impl Model {
         if let Some(entry) = self.comment_cache.get(&cache_key) {
             if entry.scope == self.cache_scope && entry.fetched_at.elapsed() < COMMENT_CACHE_TTL {
                 self.comments = entry.comments.clone();
+                self.insert_post_root_comment_placeholder();
                 self.collapsed_comments.clear();
                 self.selected_comment = 0;
                 self.comment_offset.set(0);
                 self.rebuild_visible_comments_reset();
-                if self.comments.is_empty() {
+                let real_total = self
+                    .comments
+                    .iter()
+                    .filter(|entry| !entry.is_post_root)
+                    .count();
+                if real_total == 0 {
                     self.comment_status = format!(
                         "No comments yet. (cached · sorted by {})",
                         comment_sort_label(self.comment_sort)
                     );
                 } else {
-                    let total = self.comments.len();
-                    let visible = self.visible_comment_indices.len();
-                    if visible == total {
+                    let visible = self
+                        .visible_comment_indices
+                        .iter()
+                        .filter(|idx| {
+                            self.comments
+                                .get(**idx)
+                                .is_some_and(|entry| !entry.is_post_root)
+                        })
+                        .count();
+                    if visible == real_total {
                         self.comment_status = format!(
-                            "{total} comments loaded (cached · sorted by {})",
+                            "{real_total} comments loaded (cached · sorted by {})",
                             comment_sort_label(self.comment_sort)
                         );
                     } else {
-                        let hidden = total.saturating_sub(visible);
+                        let hidden = real_total.saturating_sub(visible);
                         self.comment_status = format!(
-                            "{total} comments loaded (cached · sorted by {}) · {visible} visible · {hidden} hidden",
+                            "{real_total} comments loaded (cached · sorted by {}) · {visible} visible · {hidden} hidden",
                             comment_sort_label(self.comment_sort)
                         );
                     }
@@ -9008,6 +10113,10 @@ impl Model {
         if self.help_visible {
             self.draw_help_overlay(frame, layout[1]);
         }
+
+        if self.comment_composer.is_some() {
+            self.draw_comment_composer(frame, layout[1]);
+        }
     }
 
     fn resolve_media_origin(&self, layout: MediaLayout) -> Option<MediaOrigin> {
@@ -9057,7 +10166,11 @@ impl Model {
     }
 
     fn flush_inline_images(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
-        if self.action_menu_visible || self.menu_visible || self.help_visible {
+        if self.action_menu_visible
+            || self.menu_visible
+            || self.help_visible
+            || self.comment_composer.is_some()
+        {
             self.needs_kitty_flush = true;
             self.emit_active_kitty_delete(backend)?;
             return Ok(());
@@ -11132,6 +12245,10 @@ impl Model {
             return "Help: Esc or ? to close".to_string();
         }
 
+        if self.comment_composer.is_some() {
+            return "Comment composer: type to edit · Ctrl+S submit · Esc cancel".to_string();
+        }
+
         if self.action_menu_visible {
             return "Actions: j/k move · Enter/l open · h/Esc close".to_string();
         }
@@ -11167,10 +12284,10 @@ impl Model {
             Pane::Comments => {
                 if self.pending_comments.is_some() {
                     parts.push("Loading comments…".to_string());
-                } else if self.comments.is_empty() {
+                } else if !self.comments.iter().any(|entry| !entry.is_post_root) {
                     parts.push("No comments yet".to_string());
                 } else {
-                    parts.push("Comments: j/k move · ←/→ sort · y copy".to_string());
+                    parts.push("Comments: j/k move · ←/→ sort · y copy · w reply".to_string());
                 }
             }
         }
@@ -11185,6 +12302,7 @@ impl Model {
 
         parts.push("h/l focus panes".to_string());
         parts.push("o actions menu".to_string());
+        parts.push("w write comment".to_string());
         parts.push("? help".to_string());
         parts.push("m guided menu".to_string());
         parts.push("q quit".to_string());
