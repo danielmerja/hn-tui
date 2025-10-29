@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::auth;
 use crate::config;
 use crate::data::{self, CommentService, FeedService, InteractionService, SubredditService};
+use crate::hackernews;
 use crate::media;
 use crate::reddit;
 use crate::session;
@@ -30,27 +30,28 @@ pub fn run() -> Result<()> {
     let media_manager = media::Manager::new(store.clone(), media_cfg).ok();
     let media_handle = media_manager.as_ref().map(|manager| manager.handle());
 
-    let theme = &cfg.ui.theme;
-    let mut status = format!("Theme {theme} active. Press m for the guided menu or q to quit.");
-    let mut content = format!(
-        "Open the guided menu with m, then press a to add a Reddit account.\n\nConfigure reddit.client_id, reddit.client_secret (optional), and reddit.redirect_uri in {display_path} before authorizing."
-    );
+    let _theme = &cfg.ui.theme;
+    let status: String;
+    let content: String;
+    
     let subreddits = vec![
-        "r/frontpage".to_string(),
-        "r/popular".to_string(),
-        "r/programming".to_string(),
-        "r/rust".to_string(),
+        "Top".to_string(),
+        "New".to_string(),
+        "Best".to_string(),
+        "Ask HN".to_string(),
+        "Show HN".to_string(),
+        "Jobs".to_string(),
     ];
     let mut posts: Vec<ui::PostPreview> = vec![
         placeholder_post(
-            "connect",
-            "Connect your Reddit account",
-            "Press m to open the guided menu, then press a to start the Reddit sign-in flow.\nMake sure reddit.client_id and reddit.redirect_uri are set in the config file before you authorize.",
+            "welcome",
+            "Welcome to HN-TUI",
+            "Browse Hacker News from your terminal.\n\nUse j/k to navigate stories, Enter to view comments, h/l to switch panes.",
         ),
         placeholder_post(
             "shortcuts",
             "Keyboard shortcuts",
-            "Use h and l to move between panes, j and k to move within a list, p to refresh posts, s to sync subreddit subscriptions, and q to quit.",
+            "j/k: Navigate up/down\nh/l: Switch between panes\nEnter: View story or comments\np: Refresh\nq: Quit",
         ),
     ];
 
@@ -59,82 +60,43 @@ pub fn run() -> Result<()> {
     let mut comment_service: Option<Arc<dyn data::CommentService + Send + Sync>> = None;
     let mut interaction_service: Option<Arc<dyn data::InteractionService + Send + Sync>> = None;
 
-    let mut session_manager: Option<Arc<session::Manager>> = None;
-    let mut fetch_subreddits_on_start = false;
+    let session_manager: Option<Arc<session::Manager>> = None;
+    let fetch_subreddits_on_start = true;
 
-    let login_ready = !cfg.reddit.client_id.trim().is_empty()
-        && !cfg.reddit.user_agent.trim().is_empty()
-        && !cfg.reddit.redirect_uri.trim().is_empty();
-
-    if login_ready {
-        let flow_cfg = auth::Config {
-            client_id: cfg.reddit.client_id.clone(),
-            client_secret: cfg.reddit.client_secret.clone(),
-            scope: cfg.reddit.scopes.clone(),
-            user_agent: cfg.reddit.user_agent.clone(),
-            auth_url: "https://www.reddit.com/api/v1/authorize".into(),
-            token_url: "https://www.reddit.com/api/v1/access_token".into(),
-            identity_url: "https://oauth.reddit.com/api/v1/me".into(),
-            redirect_uri: cfg.reddit.redirect_uri.clone(),
-            refresh_skew: std::time::Duration::from_secs(30),
-        };
-
-        if let Ok(flow) = auth::Flow::new(store.clone(), flow_cfg) {
-            let flow = Arc::new(flow);
-            if let Ok(raw_manager) = session::Manager::new(store.clone(), flow.clone()) {
-                let manager = Arc::new(raw_manager);
-                if manager.load_existing().is_ok() {
-                    if let Some(session) = manager.active() {
-                        let username = session.account.username.clone();
-                        status = format!("Signed in as {username}. Press q to quit.");
-                        content =
-                            format!("Active account: {username}\nRemaining requests: loading...");
-
-                        if let Ok(token_provider) = manager.active_token_provider() {
-                            if let Ok(client) = reddit::Client::new(
-                                token_provider,
-                                reddit::ClientConfig {
-                                    user_agent: cfg.reddit.user_agent.clone(),
-                                    base_url: None,
-                                    http_client: None,
-                                },
-                            ) {
-                                let client = Arc::new(client);
-                                let subreddit_api: Arc<dyn SubredditService + Send + Sync> =
-                                    Arc::new(data::RedditSubredditService::new(client.clone()));
-                                let feed_api: Arc<dyn FeedService + Send + Sync> =
-                                    Arc::new(data::RedditFeedService::new(client.clone()));
-                                let comment_api: Arc<dyn CommentService + Send + Sync> =
-                                    Arc::new(data::RedditCommentService::new(client.clone()));
-                                let interaction_api: Arc<dyn InteractionService + Send + Sync> =
-                                    Arc::new(data::RedditInteractionService::new(client.clone()));
-
-                                feed_service = Some(feed_api);
-                                subreddit_service = Some(subreddit_api);
-                                comment_service = Some(comment_api);
-                                interaction_service = Some(interaction_api);
-                                fetch_subreddits_on_start = true;
-                                posts.clear();
-                            }
-                        }
-                    } else {
-                        status = "Ready to authorize a Reddit account. Press m then a to begin."
-                            .to_string();
-                        content = format!(
-                            "Your Reddit API credentials were found, but no account is signed in yet.\nPress m to open the guided menu, choose Add account, and follow the authorization flow.\nConfig file: {display_path}"
-                        );
-                    }
-                }
-                session_manager = Some(manager);
-            }
-        }
+    // Initialize HackerNews client (no authentication needed)
+    let user_agent = if !cfg.reddit.user_agent.trim().is_empty() {
+        cfg.reddit.user_agent.clone()
     } else {
-        status = format!(
-            "Reddit credentials missing. Add reddit.client_id to {display_path} and press m to authorize."
-        );
-        content = format!(
-            "Update {display_path} with a reddit.client_id (and optional reddit.client_secret).\nThen press m and choose Add account to sign in. Until then you can explore the interface using the built-in quickstart cards."
-        );
+        format!("hn-tui/{}", crate::VERSION)
+    };
+
+    if let Ok(client) = hackernews::Client::new(hackernews::ClientConfig {
+        user_agent: user_agent.clone(),
+        http_client: None,
+    }) {
+        let client = Arc::new(client);
+        
+        // Create HackerNews service implementations
+        let subreddit_api: Arc<dyn SubredditService + Send + Sync> =
+            Arc::new(data::HackerNewsCategoryService::new(client.clone()));
+        let feed_api: Arc<dyn FeedService + Send + Sync> =
+            Arc::new(data::HackerNewsFeedService::new(client.clone()));
+        let comment_api: Arc<dyn CommentService + Send + Sync> =
+            Arc::new(data::HackerNewsCommentService::new(client.clone()));
+        let interaction_api: Arc<dyn InteractionService + Send + Sync> =
+            Arc::new(data::HackerNewsInteractionService::new());
+
+        feed_service = Some(feed_api);
+        subreddit_service = Some(subreddit_api);
+        comment_service = Some(comment_api);
+        interaction_service = Some(interaction_api);
+        
+        status = "Browsing Hacker News. Press j/k to navigate, Enter to view comments, q to quit.".to_string();
+        content = "HN-TUI is ready! Select a category on the left and browse stories.\n\nNo authentication required - all HN content is public.".to_string();
+        posts.clear();
+    } else {
+        status = "Failed to initialize HackerNews client.".to_string();
+        content = "Could not connect to Hacker News. Please check your internet connection.".to_string();
     }
 
     let options = ui::Options {
@@ -179,7 +141,7 @@ fn friendly_path(path: Option<&std::path::PathBuf>) -> String {
         }
         path.display().to_string()
     } else {
-        "~/.config/reddix/config.yaml".to_string()
+        "~/.config/hn-tui/config.yaml".to_string()
     }
 }
 
@@ -191,13 +153,13 @@ fn placeholder_post(id: &str, title: &str, description: &str) -> ui::PostPreview
         body,
         post: reddit::Post {
             id: id.to_string(),
-            name: format!("t3_{id}"),
+            name: format!("s_{id}"),
             title: title.to_string(),
-            subreddit: "r/reddix".to_string(),
-            author: "reddix".to_string(),
+            subreddit: "top".to_string(),
+            author: "hn-tui".to_string(),
             selftext: description.to_string(),
             url: String::new(),
-            permalink: format!("/r/reddix/{id}"),
+            permalink: format!("/item/{id}"),
             score: 0,
             likes: None,
             num_comments: 0,
