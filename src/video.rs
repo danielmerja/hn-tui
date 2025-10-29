@@ -21,7 +21,7 @@ use crate::reddit::{self, PostMedia, RedditVideo};
 fn video_debug_enabled() -> bool {
     static FLAG: OnceCell<bool> = OnceCell::new();
     *FLAG.get_or_init(|| {
-        std::env::var("REDDIX_DEBUG_VIDEO")
+        std::env::var("HN_TUI_DEBUG_VIDEO")
             .map(|val| {
                 let trimmed = val.trim();
                 !(trimmed.is_empty()
@@ -38,7 +38,7 @@ fn video_debug_writer() -> Option<&'static Mutex<std::fs::File>> {
     static WRITER: OnceCell<Option<Mutex<std::fs::File>>> = OnceCell::new();
     WRITER
         .get_or_init(|| {
-            std::env::var("REDDIX_DEBUG_VIDEO_LOG")
+            std::env::var("HN_TUI_DEBUG_VIDEO_LOG")
                 .ok()
                 .and_then(|path| {
                     OpenOptions::new()

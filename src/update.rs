@@ -14,15 +14,15 @@ use serde::Deserialize;
 use tempfile::Builder as TempFileBuilder;
 
 #[cfg(target_os = "windows")]
-const INSTALLER_NAME: &str = "reddix-installer.ps1";
+const INSTALLER_NAME: &str = "hn-tui-installer.ps1";
 #[cfg(not(target_os = "windows"))]
-const INSTALLER_NAME: &str = "reddix-installer.sh";
+const INSTALLER_NAME: &str = "hn-tui-installer.sh";
 
-pub const SKIP_UPDATE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
+pub const SKIP_UPDATE_ENV: &str = "HN_TUI_SKIP_UPDATE_CHECK";
 
-const RELEASES_URL: &str = "https://api.github.com/repos/ck-zhang/reddix/releases/latest";
-const FORCE_VERSION_ENV: &str = "REDDIX_FORCE_UPDATE_VERSION";
-const FORCE_URL_ENV: &str = "REDDIX_FORCE_UPDATE_URL";
+const RELEASES_URL: &str = "https://api.github.com/repos/danielmerja/hn-tui/releases/latest";
+const FORCE_VERSION_ENV: &str = "HN_TUI_FORCE_UPDATE_VERSION";
+const FORCE_URL_ENV: &str = "HN_TUI_FORCE_UPDATE_URL";
 
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
@@ -47,7 +47,7 @@ pub fn check_for_update(current: &Version) -> Result<Option<UpdateInfo>> {
     let client = Client::builder()
         .timeout(Duration::from_secs(8))
         .user_agent(format!(
-            "reddix/{version} (update-check)",
+            "hn-tui/{version} (update-check)",
             version = crate::VERSION
         ))
         .build()
@@ -123,7 +123,7 @@ fn forced_update(current: &Version) -> Result<Option<UpdateInfo>> {
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("https://github.com/ck-zhang/reddix/releases/tag/v{version}"));
+        .unwrap_or_else(|| format!("https://github.com/danielmerja/hn-tui/releases/tag/v{version}"));
     let tag = format!("v{version}");
 
     Ok(Some(UpdateInfo {
@@ -149,7 +149,7 @@ fn release_download_base(release_url: &str, tag: &str) -> String {
         format!("{}/releases/download/{}", prefix.trim_end_matches('/'), tag)
     } else {
         format!(
-            "https://github.com/ck-zhang/reddix/releases/download/{}",
+            "https://github.com/danielmerja/hn-tui/releases/download/{}",
             tag
         )
     }
@@ -161,7 +161,7 @@ pub fn install_update(info: &UpdateInfo) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!(
-            "reddix/{version} (update-install)",
+            "hn-tui/{version} (update-install)",
             version = crate::VERSION
         ))
         .build()
@@ -180,7 +180,7 @@ pub fn install_update(info: &UpdateInfo) -> Result<()> {
         ".sh"
     };
     let mut temp = TempFileBuilder::new()
-        .prefix("reddix-installer-")
+        .prefix("hn-tui-installer-")
         .suffix(suffix)
         .tempfile()
         .context("create temporary file for installer")?;
@@ -215,7 +215,7 @@ fn run_installer(path: &Path) -> Result<()> {
             .arg("-File")
             .arg(path)
             .output()
-            .context("run reddix PowerShell installer")?;
+            .context("run hn-tui PowerShell installer")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -232,7 +232,7 @@ fn run_installer(path: &Path) -> Result<()> {
         let output = Command::new("sh")
             .arg(path)
             .output()
-            .context("run reddix installer script")?;
+            .context("run hn-tui installer script")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
