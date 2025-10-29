@@ -154,10 +154,39 @@ const COMMENT_CACHE_MAX: usize = 64;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const POST_LOADING_HEADER_HEIGHT: usize = 2;
 const UPDATE_BANNER_HEIGHT: usize = 2;
-const ICON_UPVOTES: &str = "";
-const ICON_COMMENTS: &str = "";
-const ICON_SUBREDDIT: &str = "";
-const ICON_USER: &str = "";
+
+// Nerd Font icons (requires Nerd Fonts to be installed)
+const ICON_UPVOTES_NERD: &str = "";
+const ICON_COMMENTS_NERD: &str = "";
+const ICON_SUBREDDIT_NERD: &str = "";
+const ICON_USER_NERD: &str = "";
+
+// ASCII fallback icons (work in any terminal)
+const ICON_UPVOTES_ASCII: &str = "▲";
+const ICON_COMMENTS_ASCII: &str = "💬";
+const ICON_SUBREDDIT_ASCII: &str = "📁";
+const ICON_USER_ASCII: &str = "👤";
+
+fn use_nerd_fonts() -> bool {
+    static USE_NERD: Lazy<bool> = Lazy::new(|| !env_truthy("HN_TUI_DISABLE_NERD_FONTS"));
+    *USE_NERD
+}
+
+fn icon_upvotes() -> &'static str {
+    if use_nerd_fonts() { ICON_UPVOTES_NERD } else { ICON_UPVOTES_ASCII }
+}
+
+fn icon_comments() -> &'static str {
+    if use_nerd_fonts() { ICON_COMMENTS_NERD } else { ICON_COMMENTS_ASCII }
+}
+
+fn icon_subreddit() -> &'static str {
+    if use_nerd_fonts() { ICON_SUBREDDIT_NERD } else { ICON_SUBREDDIT_ASCII }
+}
+
+fn icon_user() -> &'static str {
+    if use_nerd_fonts() { ICON_USER_NERD } else { ICON_USER_ASCII }
+}
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -2531,8 +2560,8 @@ fn build_post_row_data(
     comments_width: usize,
 ) -> PostRowData {
     let identity_line = format!(
-        "{ICON_SUBREDDIT} {}   {ICON_USER} {}",
-        input.subreddit, input.author
+        "{} {}   {} {}",
+        icon_subreddit(), input.subreddit, icon_user(), input.author
     );
     let identity = wrap_plain(&identity_line, width, Style::default());
 
@@ -2544,8 +2573,8 @@ fn build_post_row_data(
         _ => " ",
     };
     let metrics_line = format!(
-        "{vote_marker} {ICON_UPVOTES} {:>score_width$}   {ICON_COMMENTS} {:>comments_width$}",
-        input.score, input.comments
+        "{} {} {:>score_width$}   {} {:>comments_width$}",
+        vote_marker, icon_upvotes(), input.score, icon_comments(), input.comments
     );
     let metrics = wrap_plain(&metrics_line, width, Style::default());
 

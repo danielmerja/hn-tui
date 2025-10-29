@@ -58,6 +58,10 @@ You can customize:
 - Cache settings
 - Media preview settings
 
+### Environment Variables
+
+- `HN_TUI_DISABLE_NERD_FONTS=1` - Use ASCII fallback icons instead of Nerd Font icons (helpful if icons appear as boxes or question marks)
+
 ## About
 
 HN-TUI is a fork of [Reddix](https://github.com/ck-zhang/reddix), refactored to work with Hacker News instead of Reddit.
