@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.5] - 2025-10-17
+### Added
+- First-run release notes view that opens the latest highlights directly in the content pane and keeps them available from the guided menu.
+
 ## [0.2.4] - 2025-10-16
 ### Added
 - Commenting workflow inside the Comments pane so `w` lets you write threads and replies without leaving Reddix.
