@@ -5182,7 +5182,7 @@ impl Model {
                                 self.status_message = message;
                             } else if let Err(err) = self.start_authorization_flow(path.as_path()) {
                                 let message =
-                                    format!("Failed to start Reddit authorization: {err}");
+                                    format!("Failed to start authorization: {err}");
                                 self.menu_form.set_status(message.clone());
                                 self.status_message = message;
                             }
@@ -6649,15 +6649,15 @@ impl Model {
                 "Refresh & sort",
                 vec![
                     ("r", "Reload the current feed"),
-                    ("s", "Refresh subscribed lists"),
+                    ("s", "Refresh categories"),
                     ("t", "Focus comment sort controls"),
                     ("digits", "Jump directly to a post number"),
                 ],
             ),
             HelpSection::new(
-                "Vote & expand",
+                "Navigate & expand",
                 vec![
-                    ("u / d", "Upvote or downvote the selection"),
+                    ("u / d", "Upvote/downvote (not supported in HN-TUI)"),
                     ("c", "Collapse or expand a comment thread"),
                     ("Shift+C", "Expand the comment thread fully"),
                 ],
@@ -6669,9 +6669,9 @@ impl Model {
                     ("y", "Copy the highlighted comment"),
                     (
                         "w",
-                        "Write a comment (highlight the placeholder to post at the root)",
+                        "Write a comment (not supported in HN-TUI)",
                     ),
-                    ("Ctrl+S (composer)", "Submit the comment you are writing"),
+                    ("Ctrl+S (composer)", "Submit comment (not supported)"),
                     ("f", "Toggle fullscreen media preview"),
                     ("space / p (video)", "Pause or resume inline playback"),
                     (
@@ -6793,7 +6793,7 @@ impl Model {
                     self.menu_account_index = 0;
                 }
                 if self.menu_accounts.is_empty() {
-                    "Guided menu: no Reddit accounts found. Press a to add one.".to_string()
+                    "Guided menu: HN-TUI is read-only (no authentication needed). Press Esc/m to close.".to_string()
                 } else {
                     "Guided menu: j/k select account · Enter switch · a add · Esc/m close"
                         .to_string()
@@ -6818,7 +6818,7 @@ impl Model {
 
         let mut cfg = config::load(config::LoadOptions::default()).context("load config")?;
         if cfg.reddit.client_id.trim().is_empty() {
-            bail!("Reddit client ID is required before starting authorization");
+            bail!("Client ID is required before starting authorization");
         }
         if cfg.reddit.user_agent.trim().is_empty() {
             cfg.reddit.user_agent = config::RedditConfig::default().user_agent;
@@ -6852,7 +6852,7 @@ impl Model {
         let manager = self.ensure_session_manager()?;
         let authz = manager
             .begin_login()
-            .context("start Reddit authorization")?;
+            .context("start authorization")?;
         let url = authz.browser_url.clone();
 
         self.login_in_progress = true;
@@ -6942,7 +6942,7 @@ impl Model {
     fn handle_login_success(&mut self, username: String) -> Result<()> {
         self.menu_form.authorization_complete();
         let message = format!(
-            "Authorization complete. Signed in as {}. Loading Reddit data...",
+            "Authorization complete. Signed in as {}. Loading data...",
             username
         );
         self.menu_form.set_status(message.clone());
@@ -7387,7 +7387,7 @@ impl Model {
                     Ok(username) => {
                         if let Err(err) = self.handle_login_success(username) {
                             let message = format!(
-                                "Authorization completed but initializing Reddit client failed: {}",
+                                "Authorization completed but initializing client failed: {}",
                                 err
                             );
                             self.menu_form.authorization_complete();
@@ -7535,7 +7535,7 @@ impl Model {
                         let mut message = format!("Failed to submit comment: {}", err_text);
                         if err_text.to_lowercase().contains("forbidden") {
                             message.push_str(
-                                " (Reddit rejected the request — ensure reddit.scopes includes \"submit\" and re-authorize if needed.)",
+                                " (Request rejected — ensure scopes include \"submit\" and re-authorize if needed.)",
                             );
                         }
                         if let Some(composer) = self.comment_composer.as_mut() {
@@ -7743,7 +7743,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Voting requires a signed-in Reddit session (press m to log in).".to_string();
+                    "Voting is not supported in HN-TUI (HN API is read-only).".to_string();
                 return;
             }
         };
@@ -7804,7 +7804,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Voting requires a signed-in Reddit session (press m to log in).".to_string();
+                    "Voting is not supported in HN-TUI (HN API is read-only).".to_string();
                 return;
             }
         };
@@ -8043,7 +8043,7 @@ impl Model {
         }
         if self.interaction_service.is_none() {
             self.status_message =
-                "Sign in to a Reddit account before writing a comment.".to_string();
+                "Commenting is not supported in HN-TUI (HN API is read-only).".to_string();
             self.mark_dirty();
             return Ok(());
         }
@@ -8275,7 +8275,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Sign in to a Reddit account before writing a comment.".to_string();
+                    "Commenting is not supported in HN-TUI (HN API is read-only).".to_string();
                 self.mark_dirty();
                 return Ok(());
             }
@@ -9547,12 +9547,12 @@ impl Model {
             self.content_scroll = 0;
             self.content = self.fallback_content.clone();
             self.content_source = self.fallback_source.clone();
-            self.status_message = "Sign in to load Reddit posts.".to_string();
+            self.status_message = "Loading stories...".to_string();
             self.comments.clear();
             self.collapsed_comments.clear();
             self.visible_comment_indices.clear();
             self.comment_offset.set(0);
-            self.comment_status = "Sign in to load comments.".to_string();
+            self.comment_status = "Loading comments...".to_string();
             self.media_previews.clear();
             self.media_layouts.clear();
             self.media_failures.clear();
@@ -10153,7 +10153,7 @@ impl Model {
             self.collapsed_comments.clear();
             self.visible_comment_indices.clear();
             self.comment_offset.set(0);
-            self.comment_status = "Sign in to load comments.".to_string();
+            self.comment_status = "Loading comments...".to_string();
             self.pending_comments = None;
             self.close_action_menu(None);
             return Ok(());
@@ -12447,19 +12447,16 @@ impl Model {
         )]));
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::raw(
-            "1. Open Reddit app preferences at https://www.reddit.com/prefs/apps and create a script app."
+            "HN-TUI uses the Hacker News Firebase API which requires no authentication."
                 .to_string(),
         )]));
         lines.push(Line::from(vec![Span::raw(
-            "2. Add the local redirect URI 127.0.0.1:65010/reddix/callback as authorized."
+            "All stories and comments are publicly accessible without login."
                 .to_string(),
         )]));
-        lines.push(Line::from(vec![Span::raw(format!(
-            "3. Reddix will update {} with your credentials.",
-            self.config_path
-        ))]));
         lines.push(Line::from(vec![Span::raw(
-            "4. After saving, press r in the main view to reload Reddit data.".to_string(),
+            "Note: Voting and commenting are not supported (HN API is read-only)."
+                .to_string(),
         )]));
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::styled(
