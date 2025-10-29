@@ -7,6 +7,7 @@ pub mod data;
 pub mod markdown;
 pub mod media;
 pub mod reddit;
+pub mod release_notes;
 pub mod session;
 pub mod storage;
 pub mod ui;

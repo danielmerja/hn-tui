@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 const KEY_SHOW_NSFW: &str = "show_nsfw_posts";
+const KEY_LAST_SEEN_RELEASE: &str = "last_seen_release_version";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -239,6 +240,39 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value
             params![KEY_SHOW_NSFW, if show { "1" } else { "0" }],
         )
         .context("storage: persist show nsfw preference")?;
+        Ok(())
+    }
+
+    pub fn last_seen_release_version(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                params![KEY_LAST_SEEN_RELEASE],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("storage: query last seen release version")?;
+        Ok(value
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
+    pub fn set_last_seen_release_version(&self, version: &str) -> Result<()> {
+        let trimmed = version.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+INSERT INTO app_state (key, value)
+VALUES (?1, ?2)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+"#,
+            params![KEY_LAST_SEEN_RELEASE, trimmed],
+        )
+        .context("storage: persist last seen release version")?;
         Ok(())
     }
 

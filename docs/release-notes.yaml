@@ -1,0 +1,11 @@
+release:
+  - version: "0.2.5"
+    title: "What's new in v0.2.5"
+    banner: "Comments arrive! Reauthorize Reddit to grant the new submit scope."
+    summary: "Press Enter to review what changed and how to enable comment posting."
+    url: "https://github.com/ck-zhang/reddix/releases/tag/v0.2.5"
+    details:
+      - "Reply from the terminal: highlight a comment or the \"Comment thread\" entry and press w."
+      - "Existing installs must reauthorize Reddit access via the guided menu so the submit scope is granted."
+      - "If submissions fail, open the guided menu (m) and walk through Add new account to refresh credentials."
+

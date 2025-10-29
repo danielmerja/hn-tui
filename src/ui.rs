@@ -58,6 +58,7 @@ use crate::data::{CommentService, FeedService, InteractionService, SubredditServ
 use crate::markdown;
 use crate::media;
 use crate::reddit;
+use crate::release_notes;
 use crate::session;
 use crate::storage;
 use crate::update::{self, SKIP_UPDATE_ENV};
@@ -752,6 +753,7 @@ enum MenuField {
 enum MenuScreen {
     Accounts,
     Credentials,
+    ReleaseNotes,
 }
 
 #[derive(Clone)]
@@ -771,6 +773,7 @@ struct JoinState {
 struct MenuAccountPositions {
     add: usize,
     join: usize,
+    release_notes: Option<usize>,
     update_check: usize,
     install: Option<usize>,
     github: usize,
@@ -3354,6 +3357,9 @@ pub struct Model {
     update_install_in_progress: bool,
     update_banner_selected: bool,
     update_install_finished: bool,
+    release_note_active: bool,
+    release_note: Option<release_notes::ReleaseNote>,
+    release_note_unread: bool,
     latest_known_version: Option<Version>,
     current_version: Version,
     store: Arc<storage::Store>,
@@ -3646,6 +3652,13 @@ impl Model {
         next += 1;
         let join = next;
         next += 1;
+        let release_notes = if self.release_note.is_some() {
+            let idx = next;
+            next += 1;
+            Some(idx)
+        } else {
+            None
+        };
         let update_check = next;
         next += 1;
         let install = if self.update_notice.is_some() {
@@ -3663,6 +3676,7 @@ impl Model {
         MenuAccountPositions {
             add,
             join,
+            release_notes,
             update_check,
             install,
             github,
@@ -3724,6 +3738,23 @@ impl Model {
             let _ = tx.send(AsyncResponse::JoinCommunity { account_id, result });
         });
 
+        Ok(())
+    }
+
+    fn show_release_notes_screen(&mut self) -> Result<()> {
+        let Some(note) = self.release_note.clone() else {
+            self.status_message = "No release notes available right now.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+        self.release_note_unread = false;
+        self.show_release_note_in_content(&note);
+        self.menu_screen = MenuScreen::ReleaseNotes;
+        self.status_message = format!(
+            "Release notes for v{} — Enter/o opens browser · Esc returns to accounts.",
+            note.version
+        );
+        self.mark_dirty();
         Ok(())
     }
 
@@ -3967,6 +3998,94 @@ impl Model {
         }
     }
 
+    fn append_status_message(&mut self, message: impl Into<String>) {
+        let text = message.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.status_message.trim().is_empty() {
+            self.status_message = text;
+        } else {
+            self.status_message = format!("{} · {}", self.status_message, text);
+        }
+        self.mark_dirty();
+    }
+
+    fn prepend_status_message(&mut self, message: impl Into<String>) {
+        let text = message.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.status_message.trim().is_empty() {
+            self.status_message = text;
+        } else {
+            self.status_message = format!("{} · {}", text, self.status_message);
+        }
+        self.mark_dirty();
+    }
+
+    fn dismiss_release_note(&mut self) {
+        if self.release_note_active {
+            self.release_note_active = false;
+        }
+    }
+
+    fn show_release_note_in_content(&mut self, note: &release_notes::ReleaseNote) {
+        self.release_note_active = true;
+        self.content = Self::release_note_text(note);
+        self.content_source = format!("Release notes {}", note.version);
+        self.content_scroll = 0;
+        self.focused_pane = Pane::Content;
+        self.mark_dirty();
+    }
+
+    fn release_note_text(note: &release_notes::ReleaseNote) -> Text<'static> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(vec![Span::styled(
+            note.title.clone(),
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("Version {}", note.version),
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            note.banner.clone(),
+            Style::default()
+                .fg(COLOR_TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::default());
+        for detail in &note.details {
+            lines.push(Line::from(vec![
+                Span::styled("• ".to_string(), Style::default().fg(COLOR_ACCENT)),
+                Span::styled(detail.clone(), Style::default().fg(COLOR_TEXT_PRIMARY)),
+            ]));
+        }
+        if !note.details.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![Span::styled(
+            "Press m → Release notes to revisit this message.".to_string(),
+            Style::default()
+                .fg(COLOR_TEXT_SECONDARY)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Full release notes: ".to_string(),
+                Style::default().fg(COLOR_TEXT_SECONDARY),
+            ),
+            Span::styled(note.release_url.clone(), Style::default().fg(COLOR_ACCENT)),
+        ]));
+        Text::from(lines)
+    }
+
     fn focus_status_for(pane: Pane) -> String {
         match pane {
             Pane::Comments => {
@@ -4156,6 +4275,9 @@ impl Model {
             update_install_in_progress: false,
             update_banner_selected: false,
             update_install_finished: false,
+            release_note: release_notes::latest_for(&current_version),
+            release_note_unread: false,
+            release_note_active: false,
             latest_known_version: None,
             current_version: current_version.clone(),
             store: opts.store.clone(),
@@ -4248,6 +4370,37 @@ impl Model {
         if opts.fetch_subreddits_on_start {
             if let Err(err) = model.reload_subreddits() {
                 model.status_message = format!("Failed to refresh subreddits: {err}");
+            }
+        }
+
+        if let Some(note) = model.release_note.clone() {
+            let mut should_announce = true;
+            match model.store.last_seen_release_version() {
+                Ok(Some(raw)) => {
+                    if let Ok(seen) = Version::parse(raw.trim()) {
+                        if seen >= note.version {
+                            should_announce = false;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    model.append_status_message(format!("Release note status load failed: {err}"));
+                }
+            }
+            if should_announce {
+                let banner = format!("{} · Press m → Release notes for details.", note.banner);
+                model.prepend_status_message(banner);
+                model.release_note_unread = true;
+                model.show_release_note_in_content(&note);
+                if let Err(err) = model
+                    .store
+                    .set_last_seen_release_version(&note.version.to_string())
+                {
+                    model.append_status_message(format!(
+                        "Failed to persist release note status: {err}"
+                    ));
+                }
             }
         }
 
@@ -4856,6 +5009,7 @@ impl Model {
         match self.menu_screen {
             MenuScreen::Accounts => self.handle_menu_accounts_key(code),
             MenuScreen::Credentials => self.handle_menu_credentials_key(code),
+            MenuScreen::ReleaseNotes => self.handle_menu_release_notes_key(code),
         }
     }
 
@@ -4864,6 +5018,7 @@ impl Model {
         let option_count = positions.total;
         let add_index = positions.add;
         let join_index = positions.join;
+        let release_index = positions.release_notes;
         let update_index = positions.update_check;
         let install_index = positions.install;
         let github_index = positions.github;
@@ -4904,6 +5059,12 @@ impl Model {
                 self.menu_account_index = add_index;
                 self.show_credentials_form()?;
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(idx) = release_index {
+                    self.menu_account_index = idx;
+                    self.show_release_notes_screen()?;
+                }
+            }
             KeyCode::Enter => {
                 if self.menu_account_index < self.menu_accounts.len() {
                     let account_id = self.menu_accounts[self.menu_account_index].id;
@@ -4921,6 +5082,8 @@ impl Model {
                     self.show_credentials_form()?;
                 } else if self.menu_account_index == join_index {
                     self.join_reddix_subreddit()?;
+                } else if release_index.is_some_and(|idx| self.menu_account_index == idx) {
+                    self.show_release_notes_screen()?;
                 } else if self.menu_account_index == update_index {
                     self.force_update_check();
                 } else if install_index.is_some_and(|idx| self.menu_account_index == idx) {
@@ -5044,6 +5207,25 @@ impl Model {
         }
         if dirty {
             self.mark_dirty();
+        }
+        Ok(false)
+    }
+
+    fn handle_menu_release_notes_key(&mut self, code: KeyCode) -> Result<bool> {
+        match code {
+            KeyCode::Esc => {
+                self.menu_screen = MenuScreen::Accounts;
+                self.mark_dirty();
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.menu_visible = false;
+                self.status_message = "Guided menu closed.".to_string();
+                self.mark_dirty();
+            }
+            KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.open_release_notes_link()?;
+            }
+            _ => {}
         }
         Ok(false)
     }
@@ -6536,6 +6718,33 @@ impl Model {
             }
         }
     }
+
+    fn open_release_notes_link(&mut self) -> Result<()> {
+        let Some(note) = &self.release_note else {
+            self.status_message = "Release notes unavailable.".to_string();
+            self.mark_dirty();
+            return Ok(());
+        };
+
+        match webbrowser::open(note.release_url.as_str()) {
+            Ok(_) => {
+                self.release_note_unread = false;
+                self.status_message = format!(
+                    "Opened release notes for v{} in your browser.",
+                    note.version
+                );
+                self.mark_dirty();
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!("Failed to open release notes: {err}");
+                self.status_message = message.clone();
+                self.mark_dirty();
+                Err(anyhow!(message))
+            }
+        }
+    }
+
     fn open_menu(&mut self) -> Result<()> {
         self.menu_form = MenuForm::default();
         self.menu_screen = MenuScreen::Accounts;
@@ -8485,6 +8694,7 @@ impl Model {
         self.update_banner_selected = false;
         self.selected_post = clamped;
         if changed {
+            self.dismiss_release_note();
             self.queue_active_kitty_delete();
             self.comment_offset.set(0);
             self.close_action_menu(None);
@@ -9169,7 +9379,9 @@ impl Model {
                     pending.cancel_flag.store(true, Ordering::SeqCst);
                 }
                 self.selected_post = 0;
-                self.sync_content_from_selection();
+                if !self.release_note_active {
+                    self.sync_content_from_selection();
+                }
                 self.selected_comment = 0;
                 self.comment_status = format!(
                     "Loading comments... · sorted by {}",
@@ -9601,6 +9813,9 @@ impl Model {
     }
 
     fn sync_content_from_selection(&mut self) {
+        if self.release_note_active {
+            return;
+        }
         self.content_scroll = 0;
         self.needs_kitty_flush = false;
         if let Some(post) = self.posts.get(self.selected_post).cloned() {
@@ -11830,6 +12045,7 @@ impl Model {
         match self.menu_screen {
             MenuScreen::Accounts => self.menu_accounts_body(),
             MenuScreen::Credentials => self.menu_credentials_body(),
+            MenuScreen::ReleaseNotes => self.menu_release_notes_body(),
         }
     }
 
@@ -11975,6 +12191,51 @@ impl Model {
             ),
         };
         lines.push(Line::from(vec![Span::styled(join_hint, join_hint_style)]));
+        if positions.release_notes.is_some() && self.release_note.is_some() {
+            lines.push(Line::default());
+        }
+        if let Some(release_idx) = positions.release_notes {
+            if let Some(note) = &self.release_note {
+                let selected = self.menu_account_index == release_idx;
+                let highlight_unread = self.release_note_unread && !selected;
+                let indicator_style = Style::default().fg(if selected || highlight_unread {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_SECONDARY
+                });
+                let mut label_style = Style::default().fg(if selected {
+                    COLOR_TEXT_PRIMARY
+                } else if highlight_unread {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_SECONDARY
+                });
+                if selected || highlight_unread {
+                    label_style = label_style.add_modifier(Modifier::BOLD);
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if selected { ">" } else { " " }.to_string(),
+                        indicator_style,
+                    ),
+                    Span::raw(" "),
+                    Span::styled(note.title.clone(), label_style),
+                ]));
+                let summary_style = Style::default()
+                    .fg(if selected {
+                        COLOR_TEXT_PRIMARY
+                    } else if highlight_unread {
+                        COLOR_ACCENT
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    })
+                    .add_modifier(Modifier::ITALIC);
+                lines.push(Line::from(vec![Span::styled(
+                    note.summary.clone(),
+                    summary_style,
+                )]));
+            }
+        }
         lines.push(Line::default());
         lines.push(Line::default());
 
@@ -12227,6 +12488,53 @@ impl Model {
         Text::from(lines)
     }
 
+    fn menu_release_notes_body(&self) -> Text<'static> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(note) = &self.release_note {
+            lines.push(Line::from(vec![Span::styled(
+                note.title.clone(),
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::default());
+            lines.push(Line::from(vec![Span::styled(
+                format!("Version {}", note.version),
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+            lines.push(Line::default());
+            for detail in &note.details {
+                lines.push(Line::from(vec![
+                    Span::styled("- ".to_string(), Style::default().fg(COLOR_ACCENT)),
+                    Span::styled(detail.clone(), Style::default().fg(COLOR_TEXT_PRIMARY)),
+                ]));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(vec![Span::styled(
+                "Press Enter or o to open the full release notes in your browser.",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "Press Esc to return to the account list.",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                "No release notes available right now.",
+                Style::default()
+                    .fg(COLOR_TEXT_SECONDARY)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+        Text::from(lines)
+    }
+
     fn footer_text(&self) -> String {
         if self.menu_visible {
             return match self.menu_screen {
@@ -12237,6 +12545,9 @@ impl Model {
                 MenuScreen::Credentials => {
                     "Guided menu: Tab/Shift-Tab change field · Enter save/advance/open · Esc back · m close"
                         .to_string()
+                }
+                MenuScreen::ReleaseNotes => {
+                    "Guided menu: Enter/o open release page · Esc back · m close".to_string()
                 }
             };
         }
