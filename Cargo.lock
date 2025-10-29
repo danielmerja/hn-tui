@@ -751,6 +751,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hn-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "assert_cmd",
+ "base64",
+ "chrono",
+ "crossbeam-channel",
+ "crossterm",
+ "dirs",
+ "fuzzy-matcher",
+ "hex",
+ "humantime",
+ "humantime-serde",
+ "image",
+ "indicatif",
+ "libc",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "predicates",
+ "pulldown-cmark",
+ "rand 0.8.5",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "textwrap",
+ "thiserror 1.0.69",
+ "tiny_http",
+ "tree_magic_mini",
+ "unicode-width 0.1.14",
+ "url",
+ "walkdir",
+ "webbrowser",
+]
+
+[[package]]
 name = "home"
 version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1729,52 +1775,6 @@ name = "raw-window-handle"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2ff9a1f06a88b01621b7ae906ef0211290d1c8a168a15542486a8f61c0833b9"
-
-[[package]]
-name = "reddix"
-version = "0.2.5"
-dependencies = [
- "anyhow",
- "arboard",
- "assert_cmd",
- "base64",
- "chrono",
- "crossbeam-channel",
- "crossterm",
- "dirs",
- "fuzzy-matcher",
- "hex",
- "humantime",
- "humantime-serde",
- "image",
- "indicatif",
- "libc",
- "once_cell",
- "parking_lot",
- "percent-encoding",
- "predicates",
- "pulldown-cmark",
- "rand 0.8.5",
- "ratatui",
- "regex",
- "reqwest",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha1",
- "sha2",
- "tempfile",
- "textwrap",
- "thiserror 1.0.69",
- "tiny_http",
- "tree_magic_mini",
- "unicode-width 0.1.14",
- "url",
- "walkdir",
- "webbrowser",
-]
 
 [[package]]
 name = "redox_syscall"
