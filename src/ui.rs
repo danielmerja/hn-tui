@@ -88,12 +88,12 @@ const COLOR_ACCENT: Color = Color::Rgb(137, 180, 250);
 const COLOR_SUCCESS: Color = Color::Rgb(166, 227, 161);
 const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 
-const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
+const PROJECT_LINK_URL: &str = "https://github.com/danielmerja/hn-tui";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
-const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
+const CURRENT_VERSION_OVERRIDE_ENV: &str = "HN_TUI_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
-const MPV_PATH_ENV: &str = "REDDIX_MPV_PATH";
+const MPV_PATH_ENV: &str = "HN_TUI_MPV_PATH";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
     Color::Rgb(250, 179, 135),
     Color::Rgb(166, 227, 161),
@@ -162,7 +162,7 @@ const ICON_USER: &str = "";
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("reddix/0.1 (kitty-preview)")
+        .user_agent("hn-tui/0.1 (kitty-preview)")
         .build()
         .expect("create http client")
 });
@@ -562,7 +562,7 @@ fn terminal_cell_metrics() -> CellMetrics {
 
 fn kitty_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| env_truthy("REDDIX_DEBUG_KITTY"))
+    *FLAG.get_or_init(|| env_truthy("HN_TUI_DEBUG_KITTY"))
 }
 
 fn kitty_delete_all_sequence() -> String {
@@ -1828,8 +1828,8 @@ fn make_preview(post: reddit::Post) -> PostPreview {
     body.push_str("---\n\n");
 
     let meta_lines: Vec<String> = vec![
-        format!("**Subreddit:** {}", post.subreddit),
-        format!("**Author:** u/{}", post.author),
+        format!("**Category:** {}", post.subreddit),
+        format!("**Author:** {}", post.author),
         format!("**Score:** {}", post.score),
         format!("**Comments:** {}", post.num_comments),
     ];
@@ -1841,9 +1841,13 @@ fn make_preview(post: reddit::Post) -> PostPreview {
 
     let permalink = post.permalink.trim();
     if !permalink.is_empty() {
-        let thread_url = format!("https://reddit.com{}", permalink);
+        let thread_url = if permalink.starts_with("http") {
+            permalink.to_string()
+        } else {
+            format!("https://news.ycombinator.com{}", permalink)
+        };
         if !links.iter().any(|entry| entry.url == thread_url) {
-            links.push(LinkEntry::new("Reddit thread", thread_url));
+            links.push(LinkEntry::new("HN thread", thread_url));
         }
     }
 
@@ -2527,7 +2531,7 @@ fn build_post_row_data(
     comments_width: usize,
 ) -> PostRowData {
     let identity_line = format!(
-        "{ICON_SUBREDDIT} r/{}   {ICON_USER} u/{}",
+        "{ICON_SUBREDDIT} {}   {ICON_USER} {}",
         input.subreddit, input.author
     );
     let identity = wrap_plain(&identity_line, width, Style::default());
@@ -2880,13 +2884,13 @@ impl KittyStatus {
 static KITTY_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn determine_initial_kitty_status() -> KittyStatus {
-    if env_truthy("REDDIX_DISABLE_KITTY") {
+    if env_truthy("HN_TUI_DISABLE_KITTY") {
         return KittyStatus::ForcedDisabled;
     }
-    if env_truthy("REDDIX_FORCE_KITTY") {
+    if env_truthy("HN_TUI_FORCE_KITTY") {
         return KittyStatus::ForcedEnabled;
     }
-    let enable_override = env_truthy("REDDIX_ENABLE_KITTY");
+    let enable_override = env_truthy("HN_TUI_ENABLE_KITTY");
     if running_inside_tmux() && !enable_override {
         return KittyStatus::Unsupported;
     }
@@ -3449,7 +3453,7 @@ impl Model {
         if self.kitty_status != KittyStatus::Unknown || self.kitty_probe_in_progress {
             return;
         }
-        if !env_truthy("REDDIX_EXPERIMENTAL_KITTY_PROBE") {
+        if !env_truthy("HN_TUI_EXPERIMENTAL_KITTY_PROBE") {
             return;
         }
         if KITTY_PROBE_STARTED
@@ -3545,7 +3549,7 @@ impl Model {
                     if let Some(update) = &self.update_notice {
                         if self.update_install_finished {
                             self.status_message = format!(
-                                "Update v{} installed. Restart Reddix to use the new version.",
+                                "Update v{} installed. Restart HN-TUI to use the new version.",
                                 update.version
                             );
                         } else if self.update_install_in_progress {
@@ -5475,7 +5479,7 @@ impl Model {
         }
 
         entries.push(ActionMenuEntry::new(
-            "Search subreddits & users…",
+            "Search categories & users…",
             ActionMenuAction::OpenNavigation,
         ));
 
@@ -10268,7 +10272,7 @@ impl Model {
         } else {
             self.status_message.clone()
         };
-        let version_status = format!("Reddix {}", self.version_summary());
+        let version_status = format!("HN-TUI {}", self.version_summary());
         let mut status_parts: Vec<String> = Vec::new();
         if !raw_status.is_empty() {
             status_parts.push(raw_status);
@@ -11293,7 +11297,7 @@ impl Model {
             let detail_text = if installing {
                 "Installer running… you can keep browsing while it finishes."
             } else if self.update_install_finished {
-                "Update installed. Restart Reddix to use the new version."
+                "Update installed. Restart HN-TUI to use the new version."
             } else if highlight {
                 "Press Enter to install now · Shift+U works anywhere."
             } else {
@@ -12274,7 +12278,7 @@ impl Model {
             ),
             Span::raw(" "),
             Span::styled("Re-run update check · ".to_string(), update_label_style),
-            Span::styled(format!("Reddix {}", self.version_summary()), summary_style),
+            Span::styled(format!("HN-TUI {}", self.version_summary()), summary_style),
         ]));
 
         if let Some(install_idx) = positions.install {
