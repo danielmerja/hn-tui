@@ -1872,6 +1872,12 @@ fn make_preview(post: reddit::Post) -> PostPreview {
     if !permalink.is_empty() {
         let thread_url = if permalink.starts_with("http") {
             permalink.to_string()
+        } else if permalink.contains("?id=") {
+            // Already has correct format like /item?id=123
+            format!("https://news.ycombinator.com{}", permalink)
+        } else if let Some(id) = permalink.strip_prefix("/item/") {
+            // Old format /item/123, convert to ?id=123
+            format!("https://news.ycombinator.com/item?id={}", id)
         } else {
             format!("https://news.ycombinator.com{}", permalink)
         };
@@ -3734,43 +3740,9 @@ impl Model {
     }
 
     fn join_reddix_subreddit(&mut self) -> Result<()> {
-        let Some(service) = self.interaction_service.clone() else {
-            self.status_message = format!("Sign in to join {}.", REDDIX_COMMUNITY_DISPLAY);
-            self.mark_dirty();
-            return Ok(());
-        };
-
-        let Some(account_id) = self.active_account_id() else {
-            self.status_message = "Select an account before joining the community.".to_string();
-            self.mark_dirty();
-            return Ok(());
-        };
-
-        let state = self.join_states.entry(account_id).or_default();
-        if state.joined {
-            self.status_message = format!("Already subscribed to {}.", REDDIX_COMMUNITY_DISPLAY);
-            self.mark_dirty();
-            return Ok(());
-        }
-        if state.pending {
-            self.status_message = format!(
-                "Joining {} is already in progress...",
-                REDDIX_COMMUNITY_DISPLAY
-            );
-            self.mark_dirty();
-            return Ok(());
-        }
-
-        state.mark_pending();
-        self.status_message = format!("Joining {}…", REDDIX_COMMUNITY_DISPLAY);
+        // HN-TUI doesn't have community subscriptions
+        self.status_message = "Community subscriptions are not available in HN-TUI.".to_string();
         self.mark_dirty();
-
-        let tx = self.response_tx.clone();
-        thread::spawn(move || {
-            let result = service.subscribe(REDDIX_COMMUNITY);
-            let _ = tx.send(AsyncResponse::JoinCommunity { account_id, result });
-        });
-
         Ok(())
     }
 

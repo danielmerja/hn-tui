@@ -302,7 +302,7 @@ impl Item {
             author: self.by.unwrap_or_default(),
             selftext: self.text.unwrap_or_default(),
             url: self.url.unwrap_or_default(),
-            permalink: format!("{}/{}", HN_ITEM_URL, self.id),
+            permalink: format!("{}?id={}", HN_ITEM_URL, self.id),
             score: self.score.unwrap_or(0),
             likes: None,
             num_comments: self.descendants.unwrap_or(0),

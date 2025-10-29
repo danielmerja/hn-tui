@@ -713,12 +713,12 @@ impl InteractionService for HackerNewsInteractionService {
     }
 }
 
+// Type alias: hackernews::Story is defined as reddit::Post in hackernews module
 fn hn_story_to_reddit_post(story: hackernews::Story) -> reddit::Post {
-    // Story is already a reddit::Post, so just return it
     story
 }
 
+// Comment is already reddit::Comment type (reused from reddit module)
 fn hn_comment_to_reddit_comment(comment: reddit::Comment) -> reddit::Comment {
-    // Comment is already a reddit::Comment, so just return it
     comment
 }
