@@ -146,7 +146,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/re
 cargo build --release --profile dist
 
 # Or build with cargo-dist for cross-platform
-dist build --artifacts=local
+cargo dist build --artifacts=local
 ```
 
 However, **using the GitHub Actions workflow is strongly recommended** as it:
