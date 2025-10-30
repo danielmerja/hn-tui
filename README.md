@@ -16,6 +16,20 @@ HN-TUI - Browse Hacker News from the terminal.
 
 ## Install
 
+### Binary Releases
+
+Download pre-built binaries for Linux, macOS, or Windows from the [latest release](https://github.com/danielmerja/hn-tui/releases/latest).
+
+Quick install with shell script (Linux/macOS):
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/danielmerja/hn-tui/releases/latest/download/hn-tui-installer.sh | sh
+```
+
+Or with PowerShell (Windows):
+```powershell
+irm https://github.com/danielmerja/hn-tui/releases/latest/download/hn-tui-installer.ps1 | iex
+```
+
 ### From Source
 
 ```sh
