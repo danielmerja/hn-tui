@@ -3,6 +3,7 @@ use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::hackernews;
 use crate::reddit::{self, CommentSortOption, ListingOptions, SortOption};
 
 pub trait SubredditService: Send + Sync {
@@ -438,4 +439,286 @@ pub fn sort_option_from_key(key: &str) -> SortOption {
         "rising" => SortOption::Rising,
         _ => SortOption::Hot,
     }
+}
+
+// HackerNews service implementations
+pub struct HackerNewsCategoryService {
+    _client: Arc<hackernews::Client>,
+}
+
+impl HackerNewsCategoryService {
+    pub fn new(client: Arc<hackernews::Client>) -> Self {
+        Self { _client: client }
+    }
+}
+
+impl SubredditService for HackerNewsCategoryService {
+    fn list_subreddits(&self, _source: reddit::SubredditSource) -> Result<Vec<reddit::Subreddit>> {
+        // Return HN categories as "subreddits"
+        Ok(vec![
+            reddit::Subreddit {
+                id: "top".into(),
+                name: "Top".into(),
+                title: "Top Stories".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+            reddit::Subreddit {
+                id: "new".into(),
+                name: "New".into(),
+                title: "New Stories".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+            reddit::Subreddit {
+                id: "best".into(),
+                name: "Best".into(),
+                title: "Best Stories".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+            reddit::Subreddit {
+                id: "ask".into(),
+                name: "Ask HN".into(),
+                title: "Ask HN".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+            reddit::Subreddit {
+                id: "show".into(),
+                name: "Show HN".into(),
+                title: "Show HN".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+            reddit::Subreddit {
+                id: "jobs".into(),
+                name: "Jobs".into(),
+                title: "HN Jobs".into(),
+                subscribers: 0,
+                over_18: false,
+            },
+        ])
+    }
+}
+
+pub struct HackerNewsFeedService {
+    client: Arc<hackernews::Client>,
+}
+
+impl HackerNewsFeedService {
+    pub fn new(client: Arc<hackernews::Client>) -> Self {
+        Self { client }
+    }
+}
+
+impl FeedService for HackerNewsFeedService {
+    fn load_front_page(
+        &self,
+        _sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        let start = opts.after.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let limit = opts.limit.unwrap_or(30) as usize;
+        
+        let hn_listing = self.client
+            .story_listing(hackernews::StoryType::Top, start, limit)
+            .context("fetch HN top stories")?;
+        
+        // Convert HN stories to Reddit posts for compatibility
+        Ok(reddit::Listing {
+            after: hn_listing.after,
+            before: hn_listing.before,
+            children: hn_listing.children.into_iter().map(|thing| {
+                reddit::Thing {
+                    kind: thing.kind,
+                    data: hn_story_to_reddit_post(thing.data),
+                }
+            }).collect(),
+        })
+    }
+
+    fn load_subreddit(
+        &self,
+        name: &str,
+        _sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        let start = opts.after.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let limit = opts.limit.unwrap_or(30) as usize;
+        
+        let story_type = match name.to_lowercase().trim_start_matches("r/") {
+            "new" => hackernews::StoryType::New,
+            "best" => hackernews::StoryType::Best,
+            "ask" | "askhn" => hackernews::StoryType::Ask,
+            "show" | "showhn" => hackernews::StoryType::Show,
+            "jobs" | "job" => hackernews::StoryType::Job,
+            _ => hackernews::StoryType::Top,
+        };
+        
+        let hn_listing = self.client
+            .story_listing(story_type, start, limit)
+            .context("fetch HN stories")?;
+        
+        Ok(reddit::Listing {
+            after: hn_listing.after,
+            before: hn_listing.before,
+            children: hn_listing.children.into_iter().map(|thing| {
+                reddit::Thing {
+                    kind: thing.kind,
+                    data: hn_story_to_reddit_post(thing.data),
+                }
+            }).collect(),
+        })
+    }
+
+    fn load_user(
+        &self,
+        name: &str,
+        _sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        let start = opts.after.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let limit = opts.limit.unwrap_or(30) as usize;
+        
+        let hn_listing = self.client
+            .user_stories(name, start, limit)
+            .context("fetch HN user stories")?;
+        
+        Ok(reddit::Listing {
+            after: hn_listing.after,
+            before: hn_listing.before,
+            children: hn_listing.children.into_iter().map(|thing| {
+                reddit::Thing {
+                    kind: thing.kind,
+                    data: hn_story_to_reddit_post(thing.data),
+                }
+            }).collect(),
+        })
+    }
+
+    fn search_posts(
+        &self,
+        query: &str,
+        _sort: SortOption,
+        opts: ListingOptions,
+    ) -> Result<reddit::Listing<reddit::Post>> {
+        let start = opts.after.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let limit = opts.limit.unwrap_or(30) as usize;
+        
+        let hn_listing = self.client
+            .search_stories(query, start, limit)
+            .context("search HN")?;
+        
+        Ok(reddit::Listing {
+            after: hn_listing.after,
+            before: hn_listing.before,
+            children: hn_listing.children.into_iter().map(|thing| {
+                reddit::Thing {
+                    kind: thing.kind,
+                    data: hn_story_to_reddit_post(thing.data),
+                }
+            }).collect(),
+        })
+    }
+}
+
+pub struct HackerNewsCommentService {
+    client: Arc<hackernews::Client>,
+}
+
+impl HackerNewsCommentService {
+    pub fn new(client: Arc<hackernews::Client>) -> Self {
+        Self { client }
+    }
+}
+
+impl CommentService for HackerNewsCommentService {
+    fn load_comments(
+        &self,
+        _subreddit: &str,
+        article: &str,
+        _sort: CommentSortOption,
+    ) -> Result<reddit::PostComments> {
+        let story_id: i64 = article.parse()
+            .context("parse story ID")?;
+        
+        let hn_comments = self.client
+            .comments(story_id)
+            .context("fetch HN comments")?;
+        
+        Ok(reddit::PostComments {
+            post: hn_story_to_reddit_post(hn_comments.story),
+            comments: reddit::Listing {
+                after: hn_comments.comments.after,
+                before: hn_comments.comments.before,
+                children: hn_comments.comments.children.into_iter().map(|thing| {
+                    reddit::Thing {
+                        kind: thing.kind,
+                        data: hn_comment_to_reddit_comment(thing.data),
+                    }
+                }).collect(),
+            },
+        })
+    }
+}
+
+pub struct HackerNewsInteractionService;
+
+impl HackerNewsInteractionService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl InteractionService for HackerNewsInteractionService {
+    fn vote(&self, _fullname: &str, _dir: i32) -> Result<()> {
+        // HN API doesn't support voting
+        Ok(())
+    }
+
+    fn save(&self, _fullname: &str, _category: Option<&str>) -> Result<()> {
+        // HN API doesn't support saving
+        Ok(())
+    }
+
+    fn unsave(&self, _fullname: &str) -> Result<()> {
+        // HN API doesn't support unsaving
+        Ok(())
+    }
+
+    fn hide(&self, _fullname: &str) -> Result<()> {
+        // HN API doesn't support hiding
+        Ok(())
+    }
+
+    fn unhide(&self, _fullname: &str) -> Result<()> {
+        // HN API doesn't support unhiding
+        Ok(())
+    }
+
+    fn subscribe(&self, _subreddit: &str) -> Result<()> {
+        // HN doesn't have subscriptions
+        Ok(())
+    }
+
+    fn is_subscribed(&self, _subreddit: &str) -> Result<bool> {
+        // HN doesn't have subscriptions
+        Ok(false)
+    }
+
+    fn reply(&self, _parent: &str, _text: &str) -> Result<reddit::Comment> {
+        // HN API doesn't support posting comments
+        anyhow::bail!("Posting comments is not supported via HN API")
+    }
+}
+
+// Type alias: hackernews::Story is defined as reddit::Post in hackernews module
+fn hn_story_to_reddit_post(story: hackernews::Story) -> reddit::Post {
+    story
+}
+
+// Comment is already reddit::Comment type (reused from reddit module)
+fn hn_comment_to_reddit_comment(comment: reddit::Comment) -> reddit::Comment {
+    comment
 }

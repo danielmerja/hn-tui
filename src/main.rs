@@ -3,7 +3,7 @@ fn main() {
         return;
     }
 
-    if let Err(err) = reddix::run() {
+    if let Err(err) = hn_tui::run() {
         eprintln!("error: {err:?}");
         std::process::exit(1);
     }
@@ -14,12 +14,12 @@ fn handle_cli_flags() -> bool {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
-                println!("Reddix {}", reddix::VERSION);
+                println!("HN-TUI {}", hn_tui::VERSION);
                 saw_flag = true;
             }
             "--help" | "-h" => {
                 println!(
-                    "Reddix — Reddit, refined for the terminal.\n\n  --version, -V        Show version and exit\n  --help,    -h        Show this help message\n  --check-updates      Check for updates and exit"
+                    "HN-TUI — Browse Hacker News from the terminal.\n\n  --version, -V        Show version and exit\n  --help,    -h        Show this help message\n  --check-updates      Check for updates and exit"
                 );
                 saw_flag = true;
             }
@@ -39,16 +39,16 @@ fn handle_cli_flags() -> bool {
 fn check_updates_once() -> anyhow::Result<()> {
     use semver::Version;
 
-    let skip_env = reddix::update::SKIP_UPDATE_ENV;
+    let skip_env = hn_tui::update::SKIP_UPDATE_ENV;
     if std::env::var(skip_env).is_ok() {
         println!("Update check skipped: {skip_env} is set.");
         return Ok(());
     }
 
-    let current = Version::parse(reddix::VERSION)?;
-    match reddix::update::check_for_update(&current)? {
+    let current = Version::parse(hn_tui::VERSION)?;
+    match hn_tui::update::check_for_update(&current)? {
         Some(info) => {
-            let reddix::update::UpdateInfo {
+            let hn_tui::update::UpdateInfo {
                 version,
                 release_url,
                 ..
@@ -56,7 +56,7 @@ fn check_updates_once() -> anyhow::Result<()> {
             println!("Update available: {current} -> {version}\n{release_url}");
         }
         None => {
-            println!("Reddix {current} is up to date.");
+            println!("HN-TUI {current} is up to date.");
         }
     }
     Ok(())

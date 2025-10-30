@@ -48,7 +48,7 @@ impl Default for RedditConfig {
 }
 
 fn default_user_agent() -> String {
-    "reddix-dev/0.1 (+https://github.com/ck-zhang/reddix)".to_string()
+    "hn-tui-dev/0.1 (+https://github.com/danielmerja/hn-tui)".to_string()
 }
 
 fn default_scopes() -> Vec<String> {
@@ -63,7 +63,7 @@ fn default_scopes() -> Vec<String> {
 }
 
 fn default_redirect_uri() -> String {
-    "http://127.0.0.1:65010/reddix/callback".into()
+    "http://127.0.0.1:65010/hn-tui/callback".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,7 +111,7 @@ impl Default for MediaConfig {
 }
 
 fn default_cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("reddix"))
+    dirs::cache_dir().map(|dir| dir.join("hn-tui"))
 }
 
 fn default_max_size_bytes() -> i64 {
@@ -306,7 +306,7 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("reddix").join("config.yaml"))
+    dirs::config_dir().map(|dir| dir.join("hn-tui").join("config.yaml"))
 }
 
 pub fn save_reddit_credentials(

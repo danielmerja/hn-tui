@@ -1,37 +1,81 @@
-# Reddix
+# HN-TUI
 
-[![Release](https://img.shields.io/github/v/release/ck-zhang/reddix?style=flat-square)](https://github.com/ck-zhang/reddix/releases/latest)
+[![Release](https://img.shields.io/github/v/release/danielmerja/hn-tui?style=flat-square)](https://github.com/danielmerja/hn-tui/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
-Reddix - Reddit, refined for the terminal.
-
-![Reddix UI](docs/assets/reddix-ui-preview.png)
+HN-TUI - Browse Hacker News from the terminal.
 
 ## Features
 
-- image preview based on kitty graphics protocol
-- video playback through mpv's Kitty integration
-- multi-account support
-- keyboard first navigation
-- smart caching
-- NSFW filter toggle
+- Browse Hacker News stories (Top, New, Best, Ask HN, Show HN, Jobs)
+- Read comments with threaded display
+- Keyboard-first navigation
+- No authentication required (HN API is public)
+- Terminal-native interface using Ratatui
+- Smart caching
 
 ## Install
 
-Download the latest [release](https://github.com/ck-zhang/reddix/releases/latest) from GitHub or run one of the installers
+### From Source
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ck-zhang/reddix/releases/latest/download/reddix-installer.sh | sh
+git clone https://github.com/danielmerja/hn-tui
+cd hn-tui
+cargo build --release
+./target/release/hn-tui
 ```
 
-## Quickstart
-1. Create a Reddit “script” at https://www.reddit.com/prefs/apps and set the redirect URI to `http://127.0.0.1:65010/reddix/callback`.
-2. Launch `reddix`, press `m`, and follow the guided menu for setup.
-3. Prefer to configure things manually? Copy [`docs/examples/config.yaml`](docs/examples/config.yaml) into `~/.config/reddix/config.yaml` and fill in your credentials.
+### Using Cargo
 
-Core shortcuts: `j/k` move, `h/l` change panes, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
+```sh
+cargo install --git https://github.com/danielmerja/hn-tui
+```
 
-## Support
-- Feature requests and contributions are welcome, this project is in its very early stage.
-- Track ongoing ideas in the [feature request log](docs/feature-requests.md).
-- Donation: https://ko-fi.com/ckzhang
+## Usage
+
+Simply run:
+
+```sh
+hn-tui
+```
+
+No configuration or authentication needed - the Hacker News API is completely public.
+
+### Keyboard Shortcuts
+
+- `j/k` - Navigate up/down in lists
+- `h/l` - Switch between panes (categories/stories/content)
+- `Enter` - View story or open comments
+- `p` - Refresh current view
+- `q` - Quit
+
+## Configuration
+
+Configuration file is optional and located at `~/.config/hn-tui/config.yaml`.
+
+You can customize:
+- UI theme
+- Cache settings
+- Media preview settings
+
+### Environment Variables
+
+- `HN_TUI_DISABLE_NERD_FONTS=1` - Use ASCII fallback icons instead of Nerd Font icons (helpful if icons appear as boxes or question marks)
+
+## About
+
+HN-TUI is a fork of [Reddix](https://github.com/ck-zhang/reddix), refactored to work with Hacker News instead of Reddit.
+
+Key changes:
+- Replaced Reddit OAuth with Hacker News Firebase API
+- Removed authentication (HN is public)
+- Adapted UI for HN story categories
+- Simplified configuration
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details
+
+## Original Credits
+
+This project is based on Reddix by ck-zhang. Original concept and UI design credit goes to the Reddix project.

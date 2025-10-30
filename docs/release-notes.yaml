@@ -1,11 +1,12 @@
 release:
-  - version: "0.2.5"
-    title: "What's new in v0.2.5"
-    banner: "Comments arrive! Reauthorize Reddit to grant the new submit scope."
-    summary: "Press Enter to review what changed and how to enable comment posting."
-    url: "https://github.com/ck-zhang/reddix/releases/tag/v0.2.5"
+  - version: "0.1.0"
+    title: "HN-TUI Initial Release"
+    banner: "Browse Hacker News from your terminal!"
+    summary: "HN-TUI is a fork of Reddix, refactored to work with Hacker News."
+    url: "https://github.com/danielmerja/hn-tui/releases/tag/v0.1.0"
     details:
-      - "Reply from the terminal: highlight a comment or the \"Comment thread\" entry and press w."
-      - "Existing installs must reauthorize Reddit access via the guided menu so the submit scope is granted."
-      - "If submissions fail, open the guided menu (m) and walk through Add new account to refresh credentials."
+      - "Browse HN stories by category: Top, New, Best, Ask HN, Show HN, and Jobs."
+      - "Read comments with full threading support."
+      - "No authentication required - the Hacker News API is completely public."
+      - "Note: Voting and commenting are not supported (HN API is read-only)."
 

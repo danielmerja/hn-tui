@@ -88,12 +88,12 @@ const COLOR_ACCENT: Color = Color::Rgb(137, 180, 250);
 const COLOR_SUCCESS: Color = Color::Rgb(166, 227, 161);
 const COLOR_ERROR: Color = Color::Rgb(243, 139, 168);
 
-const PROJECT_LINK_URL: &str = "https://github.com/ck-zhang/reddix";
+const PROJECT_LINK_URL: &str = "https://github.com/danielmerja/hn-tui";
 const SUPPORT_LINK_URL: &str = "https://ko-fi.com/ckzhang";
-const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
+const CURRENT_VERSION_OVERRIDE_ENV: &str = "HN_TUI_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
-const MPV_PATH_ENV: &str = "REDDIX_MPV_PATH";
+const MPV_PATH_ENV: &str = "HN_TUI_MPV_PATH";
 const COMMENT_DEPTH_COLORS: [Color; 6] = [
     Color::Rgb(250, 179, 135),
     Color::Rgb(166, 227, 161),
@@ -154,15 +154,44 @@ const COMMENT_CACHE_MAX: usize = 64;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const POST_LOADING_HEADER_HEIGHT: usize = 2;
 const UPDATE_BANNER_HEIGHT: usize = 2;
-const ICON_UPVOTES: &str = "";
-const ICON_COMMENTS: &str = "";
-const ICON_SUBREDDIT: &str = "";
-const ICON_USER: &str = "";
+
+// Nerd Font icons (requires Nerd Fonts to be installed)
+const ICON_UPVOTES_NERD: &str = "";
+const ICON_COMMENTS_NERD: &str = "";
+const ICON_SUBREDDIT_NERD: &str = "";
+const ICON_USER_NERD: &str = "";
+
+// ASCII fallback icons (work in any terminal)
+const ICON_UPVOTES_ASCII: &str = "▲";
+const ICON_COMMENTS_ASCII: &str = "💬";
+const ICON_SUBREDDIT_ASCII: &str = "📁";
+const ICON_USER_ASCII: &str = "👤";
+
+fn use_nerd_fonts() -> bool {
+    static USE_NERD: Lazy<bool> = Lazy::new(|| !env_truthy("HN_TUI_DISABLE_NERD_FONTS"));
+    *USE_NERD
+}
+
+fn icon_upvotes() -> &'static str {
+    if use_nerd_fonts() { ICON_UPVOTES_NERD } else { ICON_UPVOTES_ASCII }
+}
+
+fn icon_comments() -> &'static str {
+    if use_nerd_fonts() { ICON_COMMENTS_NERD } else { ICON_COMMENTS_ASCII }
+}
+
+fn icon_subreddit() -> &'static str {
+    if use_nerd_fonts() { ICON_SUBREDDIT_NERD } else { ICON_SUBREDDIT_ASCII }
+}
+
+fn icon_user() -> &'static str {
+    if use_nerd_fonts() { ICON_USER_NERD } else { ICON_USER_ASCII }
+}
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("reddix/0.1 (kitty-preview)")
+        .user_agent("hn-tui/0.1 (kitty-preview)")
         .build()
         .expect("create http client")
 });
@@ -562,7 +591,7 @@ fn terminal_cell_metrics() -> CellMetrics {
 
 fn kitty_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| env_truthy("REDDIX_DEBUG_KITTY"))
+    *FLAG.get_or_init(|| env_truthy("HN_TUI_DEBUG_KITTY"))
 }
 
 fn kitty_delete_all_sequence() -> String {
@@ -1828,8 +1857,8 @@ fn make_preview(post: reddit::Post) -> PostPreview {
     body.push_str("---\n\n");
 
     let meta_lines: Vec<String> = vec![
-        format!("**Subreddit:** {}", post.subreddit),
-        format!("**Author:** u/{}", post.author),
+        format!("**Category:** {}", post.subreddit),
+        format!("**Author:** {}", post.author),
         format!("**Score:** {}", post.score),
         format!("**Comments:** {}", post.num_comments),
     ];
@@ -1841,9 +1870,19 @@ fn make_preview(post: reddit::Post) -> PostPreview {
 
     let permalink = post.permalink.trim();
     if !permalink.is_empty() {
-        let thread_url = format!("https://reddit.com{}", permalink);
+        let thread_url = if permalink.starts_with("http") {
+            permalink.to_string()
+        } else if permalink.contains("?id=") {
+            // Already has correct format like /item?id=123
+            format!("https://news.ycombinator.com{}", permalink)
+        } else if let Some(id) = permalink.strip_prefix("/item/") {
+            // Old format /item/123, convert to ?id=123
+            format!("https://news.ycombinator.com/item?id={}", id)
+        } else {
+            format!("https://news.ycombinator.com{}", permalink)
+        };
         if !links.iter().any(|entry| entry.url == thread_url) {
-            links.push(LinkEntry::new("Reddit thread", thread_url));
+            links.push(LinkEntry::new("HN thread", thread_url));
         }
     }
 
@@ -2527,8 +2566,8 @@ fn build_post_row_data(
     comments_width: usize,
 ) -> PostRowData {
     let identity_line = format!(
-        "{ICON_SUBREDDIT} r/{}   {ICON_USER} u/{}",
-        input.subreddit, input.author
+        "{} {}   {} {}",
+        icon_subreddit(), input.subreddit, icon_user(), input.author
     );
     let identity = wrap_plain(&identity_line, width, Style::default());
 
@@ -2540,8 +2579,8 @@ fn build_post_row_data(
         _ => " ",
     };
     let metrics_line = format!(
-        "{vote_marker} {ICON_UPVOTES} {:>score_width$}   {ICON_COMMENTS} {:>comments_width$}",
-        input.score, input.comments
+        "{} {} {:>score_width$}   {} {:>comments_width$}",
+        vote_marker, icon_upvotes(), input.score, icon_comments(), input.comments
     );
     let metrics = wrap_plain(&metrics_line, width, Style::default());
 
@@ -2880,13 +2919,13 @@ impl KittyStatus {
 static KITTY_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn determine_initial_kitty_status() -> KittyStatus {
-    if env_truthy("REDDIX_DISABLE_KITTY") {
+    if env_truthy("HN_TUI_DISABLE_KITTY") {
         return KittyStatus::ForcedDisabled;
     }
-    if env_truthy("REDDIX_FORCE_KITTY") {
+    if env_truthy("HN_TUI_FORCE_KITTY") {
         return KittyStatus::ForcedEnabled;
     }
-    let enable_override = env_truthy("REDDIX_ENABLE_KITTY");
+    let enable_override = env_truthy("HN_TUI_ENABLE_KITTY");
     if running_inside_tmux() && !enable_override {
         return KittyStatus::Unsupported;
     }
@@ -3449,7 +3488,7 @@ impl Model {
         if self.kitty_status != KittyStatus::Unknown || self.kitty_probe_in_progress {
             return;
         }
-        if !env_truthy("REDDIX_EXPERIMENTAL_KITTY_PROBE") {
+        if !env_truthy("HN_TUI_EXPERIMENTAL_KITTY_PROBE") {
             return;
         }
         if KITTY_PROBE_STARTED
@@ -3545,7 +3584,7 @@ impl Model {
                     if let Some(update) = &self.update_notice {
                         if self.update_install_finished {
                             self.status_message = format!(
-                                "Update v{} installed. Restart Reddix to use the new version.",
+                                "Update v{} installed. Restart HN-TUI to use the new version.",
                                 update.version
                             );
                         } else if self.update_install_in_progress {
@@ -3701,43 +3740,9 @@ impl Model {
     }
 
     fn join_reddix_subreddit(&mut self) -> Result<()> {
-        let Some(service) = self.interaction_service.clone() else {
-            self.status_message = format!("Sign in to join {}.", REDDIX_COMMUNITY_DISPLAY);
-            self.mark_dirty();
-            return Ok(());
-        };
-
-        let Some(account_id) = self.active_account_id() else {
-            self.status_message = "Select an account before joining the community.".to_string();
-            self.mark_dirty();
-            return Ok(());
-        };
-
-        let state = self.join_states.entry(account_id).or_default();
-        if state.joined {
-            self.status_message = format!("Already subscribed to {}.", REDDIX_COMMUNITY_DISPLAY);
-            self.mark_dirty();
-            return Ok(());
-        }
-        if state.pending {
-            self.status_message = format!(
-                "Joining {} is already in progress...",
-                REDDIX_COMMUNITY_DISPLAY
-            );
-            self.mark_dirty();
-            return Ok(());
-        }
-
-        state.mark_pending();
-        self.status_message = format!("Joining {}…", REDDIX_COMMUNITY_DISPLAY);
+        // HN-TUI doesn't have community subscriptions
+        self.status_message = "Community subscriptions are not available in HN-TUI.".to_string();
         self.mark_dirty();
-
-        let tx = self.response_tx.clone();
-        thread::spawn(move || {
-            let result = service.subscribe(REDDIX_COMMUNITY);
-            let _ = tx.send(AsyncResponse::JoinCommunity { account_id, result });
-        });
-
         Ok(())
     }
 
@@ -5149,7 +5154,7 @@ impl Model {
                                 self.status_message = message;
                             } else if let Err(err) = self.start_authorization_flow(path.as_path()) {
                                 let message =
-                                    format!("Failed to start Reddit authorization: {err}");
+                                    format!("Failed to start authorization: {err}");
                                 self.menu_form.set_status(message.clone());
                                 self.status_message = message;
                             }
@@ -5475,7 +5480,7 @@ impl Model {
         }
 
         entries.push(ActionMenuEntry::new(
-            "Search subreddits & users…",
+            "Search categories & users…",
             ActionMenuAction::OpenNavigation,
         ));
 
@@ -6616,15 +6621,15 @@ impl Model {
                 "Refresh & sort",
                 vec![
                     ("r", "Reload the current feed"),
-                    ("s", "Refresh subscribed lists"),
+                    ("s", "Refresh categories"),
                     ("t", "Focus comment sort controls"),
                     ("digits", "Jump directly to a post number"),
                 ],
             ),
             HelpSection::new(
-                "Vote & expand",
+                "Navigate & expand",
                 vec![
-                    ("u / d", "Upvote or downvote the selection"),
+                    ("u / d", "Upvote/downvote (not supported in HN-TUI)"),
                     ("c", "Collapse or expand a comment thread"),
                     ("Shift+C", "Expand the comment thread fully"),
                 ],
@@ -6636,9 +6641,9 @@ impl Model {
                     ("y", "Copy the highlighted comment"),
                     (
                         "w",
-                        "Write a comment (highlight the placeholder to post at the root)",
+                        "Write a comment (not supported in HN-TUI)",
                     ),
-                    ("Ctrl+S (composer)", "Submit the comment you are writing"),
+                    ("Ctrl+S (composer)", "Submit comment (not supported)"),
                     ("f", "Toggle fullscreen media preview"),
                     ("space / p (video)", "Pause or resume inline playback"),
                     (
@@ -6760,7 +6765,7 @@ impl Model {
                     self.menu_account_index = 0;
                 }
                 if self.menu_accounts.is_empty() {
-                    "Guided menu: no Reddit accounts found. Press a to add one.".to_string()
+                    "Guided menu: HN-TUI is read-only (no authentication needed). Press Esc/m to close.".to_string()
                 } else {
                     "Guided menu: j/k select account · Enter switch · a add · Esc/m close"
                         .to_string()
@@ -6785,7 +6790,7 @@ impl Model {
 
         let mut cfg = config::load(config::LoadOptions::default()).context("load config")?;
         if cfg.reddit.client_id.trim().is_empty() {
-            bail!("Reddit client ID is required before starting authorization");
+            bail!("Client ID is required before starting authorization");
         }
         if cfg.reddit.user_agent.trim().is_empty() {
             cfg.reddit.user_agent = config::RedditConfig::default().user_agent;
@@ -6819,7 +6824,7 @@ impl Model {
         let manager = self.ensure_session_manager()?;
         let authz = manager
             .begin_login()
-            .context("start Reddit authorization")?;
+            .context("start authorization")?;
         let url = authz.browser_url.clone();
 
         self.login_in_progress = true;
@@ -6909,7 +6914,7 @@ impl Model {
     fn handle_login_success(&mut self, username: String) -> Result<()> {
         self.menu_form.authorization_complete();
         let message = format!(
-            "Authorization complete. Signed in as {}. Loading Reddit data...",
+            "Authorization complete. Signed in as {}. Loading data...",
             username
         );
         self.menu_form.set_status(message.clone());
@@ -7354,7 +7359,7 @@ impl Model {
                     Ok(username) => {
                         if let Err(err) = self.handle_login_success(username) {
                             let message = format!(
-                                "Authorization completed but initializing Reddit client failed: {}",
+                                "Authorization completed but initializing client failed: {}",
                                 err
                             );
                             self.menu_form.authorization_complete();
@@ -7502,7 +7507,7 @@ impl Model {
                         let mut message = format!("Failed to submit comment: {}", err_text);
                         if err_text.to_lowercase().contains("forbidden") {
                             message.push_str(
-                                " (Reddit rejected the request — ensure reddit.scopes includes \"submit\" and re-authorize if needed.)",
+                                " (Request rejected — ensure scopes include \"submit\" and re-authorize if needed.)",
                             );
                         }
                         if let Some(composer) = self.comment_composer.as_mut() {
@@ -7710,7 +7715,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Voting requires a signed-in Reddit session (press m to log in).".to_string();
+                    "Voting is not supported in HN-TUI (HN API is read-only).".to_string();
                 return;
             }
         };
@@ -7771,7 +7776,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Voting requires a signed-in Reddit session (press m to log in).".to_string();
+                    "Voting is not supported in HN-TUI (HN API is read-only).".to_string();
                 return;
             }
         };
@@ -8010,7 +8015,7 @@ impl Model {
         }
         if self.interaction_service.is_none() {
             self.status_message =
-                "Sign in to a Reddit account before writing a comment.".to_string();
+                "Commenting is not supported in HN-TUI (HN API is read-only).".to_string();
             self.mark_dirty();
             return Ok(());
         }
@@ -8242,7 +8247,7 @@ impl Model {
             Some(service) => Arc::clone(service),
             None => {
                 self.status_message =
-                    "Sign in to a Reddit account before writing a comment.".to_string();
+                    "Commenting is not supported in HN-TUI (HN API is read-only).".to_string();
                 self.mark_dirty();
                 return Ok(());
             }
@@ -9514,12 +9519,12 @@ impl Model {
             self.content_scroll = 0;
             self.content = self.fallback_content.clone();
             self.content_source = self.fallback_source.clone();
-            self.status_message = "Sign in to load Reddit posts.".to_string();
+            self.status_message = "Loading stories...".to_string();
             self.comments.clear();
             self.collapsed_comments.clear();
             self.visible_comment_indices.clear();
             self.comment_offset.set(0);
-            self.comment_status = "Sign in to load comments.".to_string();
+            self.comment_status = "Loading comments...".to_string();
             self.media_previews.clear();
             self.media_layouts.clear();
             self.media_failures.clear();
@@ -10120,7 +10125,7 @@ impl Model {
             self.collapsed_comments.clear();
             self.visible_comment_indices.clear();
             self.comment_offset.set(0);
-            self.comment_status = "Sign in to load comments.".to_string();
+            self.comment_status = "Loading comments...".to_string();
             self.pending_comments = None;
             self.close_action_menu(None);
             return Ok(());
@@ -10268,7 +10273,7 @@ impl Model {
         } else {
             self.status_message.clone()
         };
-        let version_status = format!("Reddix {}", self.version_summary());
+        let version_status = format!("HN-TUI {}", self.version_summary());
         let mut status_parts: Vec<String> = Vec::new();
         if !raw_status.is_empty() {
             status_parts.push(raw_status);
@@ -11293,7 +11298,7 @@ impl Model {
             let detail_text = if installing {
                 "Installer running… you can keep browsing while it finishes."
             } else if self.update_install_finished {
-                "Update installed. Restart Reddix to use the new version."
+                "Update installed. Restart HN-TUI to use the new version."
             } else if highlight {
                 "Press Enter to install now · Shift+U works anywhere."
             } else {
@@ -12274,7 +12279,7 @@ impl Model {
             ),
             Span::raw(" "),
             Span::styled("Re-run update check · ".to_string(), update_label_style),
-            Span::styled(format!("Reddix {}", self.version_summary()), summary_style),
+            Span::styled(format!("HN-TUI {}", self.version_summary()), summary_style),
         ]));
 
         if let Some(install_idx) = positions.install {
@@ -12414,19 +12419,16 @@ impl Model {
         )]));
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::raw(
-            "1. Open Reddit app preferences at https://www.reddit.com/prefs/apps and create a script app."
+            "HN-TUI uses the Hacker News Firebase API which requires no authentication."
                 .to_string(),
         )]));
         lines.push(Line::from(vec![Span::raw(
-            "2. Add the local redirect URI 127.0.0.1:65010/reddix/callback as authorized."
+            "All stories and comments are publicly accessible without login."
                 .to_string(),
         )]));
-        lines.push(Line::from(vec![Span::raw(format!(
-            "3. Reddix will update {} with your credentials.",
-            self.config_path
-        ))]));
         lines.push(Line::from(vec![Span::raw(
-            "4. After saving, press r in the main view to reload Reddit data.".to_string(),
+            "Note: Voting and commenting are not supported (HN API is read-only)."
+                .to_string(),
         )]));
         lines.push(Line::default());
         lines.push(Line::from(vec![Span::styled(
